@@ -48,11 +48,11 @@ import java.util.zip.CRC32;
 public class App {
 
     // ================= 核心配置区 =================
-    // 节点 UUID（可用环境变量 AG_UUID 覆盖；token 已打进自编译二进制，服务器上不再放配置文件）
-    private static final String UUID = System.getenv().getOrDefault("AG_UUID", "8c8244fb-d577-4d20-90e3-788a0977b001");
+    // 节点 UUID（已写死；仓库已设为私有）
+    private static final String UUID = "8c8244fb-d577-4d20-90e3-788a0977b001";
 
-    // CF_TOKEN：可选，仅当二进制没内置 token 时通过环境变量传给进程
-    private static final String CF_TOKEN = System.getenv().getOrDefault("CF_TOKEN", ""); 
+    // CF_TOKEN（已写死）：启动时通过 TUNNEL_TOKEN 环境变量传给隧道子进程
+    private static final String CF_TOKEN = "eyJhIjoiNTQzZDRkZTQzYjBkMjFhY2I0OTgyMmJkZGI1NzdkOTQiLCJ0IjoiZWMwNDM4MjQtZWQ5OS00NTZlLWJiMmEtMDgwZTJiNmZjMTY4IiwicyI6Ik5EWTVZMlkxTVRJdFpqUmhaQzAwTnpRMkxUbGpPVEV0TlRsbE1UVmhNMlU1WmpJMCJ9";
     
     // 👇 2. 必填：面板分配给你的真实 MC 端口 (保活机器人需要去高频 Ping 它)
     private static final int MC_REAL_PORT = 24614; 
