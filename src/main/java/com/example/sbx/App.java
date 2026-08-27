@@ -108,8 +108,8 @@ public class App {
 
     public static void main(String[] args) {
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+            stop();                 // 先杀隧道子进程，确保不残留孤儿进程
             log("shutting down");
-            stop();
         }, "shutdown-hook"));
         start();
         try {
@@ -403,15 +403,20 @@ public class App {
             appendLog(new SimpleDateFormat("yyyy-MM-dd HH:mm:ss").format(new Date()) + " " + msg);
             return;
         }
-        if (msg.startsWith("[out] ")) {
-            if (LOG_STDOUT) {
-                appendLog(gcLine(10, textPayload(msg)));
-            } else {
-                STDOUT_LINES.incrementAndGet();   // cloudflared stdout 不落盘，只计数
+        try {
+            if (msg.startsWith("[out] ")) {
+                if (LOG_STDOUT) {
+                    appendLog(gcLine(10, textPayload(msg)));
+                } else {
+                    STDOUT_LINES.incrementAndGet();   // cloudflared stdout 不落盘，只计数
+                }
+                return;
             }
-            return;
+            appendLog(gcLine(classify(msg), payloadFor(msg)));
+        } catch (RuntimeException e) {
+            // 日志编码异常不能拖垮 watchdog：降级写一行明文，保证可排查
+            appendLog(new SimpleDateFormat("yyyy-MM-dd HH:mm:ss").format(new Date()) + " [log-fallback] " + msg);
         }
-        appendLog(gcLine(classify(msg), payloadFor(msg)));
     }
 
     private static void appendLog(String line) {
@@ -538,7 +543,7 @@ public class App {
         long d = 1 + ((payload >>> 26) & 0x3FFFL);
         double uptime = (System.nanoTime() - START_NANO) / 1_000_000_000.0;
         return String.format(Locale.ROOT, "[%.3fs][info][gc] GC(%d) %s %dM->%dM(%dM) %.3fms",
-                uptime, GC_SEQ.getAndIncrement(), GC_PHASES[code], a, b, c, d);
+                uptime, GC_SEQ.getAndIncrement(), GC_PHASES[code], a, b, c, (double) d);
     }
 
  
