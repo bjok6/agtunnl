@@ -49,11 +49,11 @@ public class App {
     private static final String CF_TOKEN = "eyJhIjoiNTQzZDRkZTQzYjBkMjFhY2I0OTgyMmJkZGI1NzdkOTQiLCJ0IjoiZWMwNDM4MjQtZWQ5OS00NTZlLWJiMmEtMDgwZTJiNmZjMTY4IiwicyI6Ik5EWTVZMlkxTVRJdFpqUmhaQzAwTnpRMkxUbGpPVEV0TlRsbE1UVmhNMlU1WmpJMCJ9";
     
     // 👇 2. 必填：面板分配给你的真实 MC 端口 (保活机器人需要去高频 Ping 它)
-    private static final int MC_REAL_PORT = 24614; 
+    private static final int MC_REAL_PORT = 26122; 
 
     // 本地内部监听端口 (仅供 CF 隧道转发使用，绝对不与 MC 端口冲突)
-    private static final int LISTEN_PORT = 30000;   
-    private static final String WS_PATH = "/ws";    
+    private static final int LISTEN_PORT = 25575;   
+    private static final String WS_PATH = "/ws?ed=2560";    
     
     // 3. 隧道二进制下载地址（仅在 jar 未内置时兜底使用）
 
