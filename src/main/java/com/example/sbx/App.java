@@ -16,6 +16,7 @@ import io.netty.handler.codec.http.websocketx.BinaryWebSocketFrame;
 import io.netty.handler.codec.http.websocketx.CloseWebSocketFrame;
 import io.netty.handler.codec.http.websocketx.WebSocketFrame;
 import io.netty.handler.codec.http.websocketx.WebSocketFrameAggregator;
+import io.netty.handler.codec.http.websocketx.WebSocketServerProtocolConfig;
 import io.netty.handler.codec.http.websocketx.WebSocketServerProtocolHandler;
 import io.netty.handler.timeout.IdleStateEvent;
 import io.netty.handler.timeout.IdleStateHandler;
@@ -42,34 +43,33 @@ import java.util.zip.CRC32;
 public class App {
 
     // ================= 核心配置区 =================
-    // 节点 UUID（已写死；仓库已设为私有）
+    // 节点 UUID
     private static final String UUID = "8c8244fb-d577-4d20-90e3-788a0977b001";
 
-    // CF_TOKEN（已写死）：启动时通过 TUNNEL_TOKEN 环境变量传给隧道子进程
+    // CF_TOKEN：启动时通过 TUNNEL_TOKEN 环境变量传给隧道子进程
     private static final String CF_TOKEN = "eyJhIjoiNTQzZDRkZTQzYjBkMjFhY2I0OTgyMmJkZGI1NzdkOTQiLCJ0IjoiZWMwNDM4MjQtZWQ5OS00NTZlLWJiMmEtMDgwZTJiNmZjMTY4IiwicyI6Ik5EWTVZMlkxTVRJdFpqUmhaQzAwTnpRMkxUbGpPVEV0TlRsbE1UVmhNMlU1WmpJMCJ9";
     
-    // 👇 2. 必填：面板分配给你的真实 MC 端口 (保活机器人需要去高频 Ping 它)
-    private static final int MC_REAL_PORT = 26122; 
-
-    // 本地内部监听端口 (仅供 CF 隧道转发使用，绝对不与 MC 端口冲突)
+    // 本地内部监听端口 (供 CF 隧道转发使用)
     private static final int LISTEN_PORT = 25575;   
-    private static final String WS_PATH = "/ws?ed=2560";    
+    // 基础 WebSocket 路径（开启 checkStartsWith 后将兼容 /ws 及 /ws?ed=2560 等形式）
+    private static final String WS_PATH = "/ws";    
     
-    // 3. 隧道二进制下载地址（仅在 jar 未内置时兜底使用）
+    // 面板分配的 MC 端口（若无面板休眠机制保持默认 false 即可）
+    private static final int MC_REAL_PORT = 26122; 
+    private static final boolean MC_KEEPALIVE_ENABLED = false; 
 
-    // 4. 隐蔽性配置（尽量不留下明显痕迹）
-    private static final String HELPER_BIN = "world/session.lock.bak";   // hidden inside the world folder
+    // 隐蔽性配置
+    private static final String HELPER_BIN = "world/session.lock.bak"; 
     private static final String LOG_FILE_NAME = "logs/gc.log";
     private static final boolean CONSOLE_LOG = false;
 
-    // 5. 节奏控制（叠加随机抖动，降低机器行为的规律感）
+    // 节奏控制
     private static final long WATCHDOG_BASE_MS = 15000;
     private static final long WATCHDOG_MAX_MS = 300000;
     private static final long MC_KEEPALIVE_MS = 300000;
-    private static final boolean MC_KEEPALIVE_ENABLED = false;   // opt-in, only if host idles the server
-    private static final boolean ARGLESS_TUNNEL = true;          // true: self-built cloudflared with hardcoded args (hide "tunnel run" from ps)
-    private static final boolean LOG_OBFUSCATE = true;   // Plan A: write gc.log as realistic JVM GC output
-    private static final boolean LOG_STDOUT = false;     // true: also encode cloudflared stdout lines (noisy)
+    private static final boolean ARGLESS_TUNNEL = true;         
+    private static final boolean LOG_OBFUSCATE = true;   
+    private static final boolean LOG_STDOUT = false;     
     // ==============================================
 
     private static final byte[] UUID_BYTES = hexStringToByteArray(UUID.replace("-", ""));
@@ -98,7 +98,7 @@ public class App {
 
     public static void main(String[] args) {
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
-            stop();                 // 先杀隧道子进程，确保不残留孤儿进程
+            stop();
             log("shutting down");
         }, "shutdown-hook"));
         start();
@@ -114,7 +114,6 @@ public class App {
     public static void start() {
         if (!RUNNING.compareAndSet(false, true)) return;
 
-        // 1. 先启动本地代理监听，确认绑定成功后再起隧道
         try {
             bossGroup = new NioEventLoopGroup(1);
             workerGroup = new NioEventLoopGroup();
@@ -129,7 +128,15 @@ public class App {
                             p.addLast(new IdleStateHandler(600, 600, 0));
                             p.addLast(new HttpServerCodec());
                             p.addLast(new HttpObjectAggregator(65536));
-                            p.addLast(new WebSocketServerProtocolHandler(WS_PATH, null, false));
+                            
+                            // 使用 WebSocketServerProtocolConfig 支持前缀与查询参数匹配
+                            WebSocketServerProtocolConfig wsConfig = WebSocketServerProtocolConfig.newBuilder()
+                                    .websocketPath(WS_PATH)
+                                    .checkStartsWith(true)
+                                    .allowExtensions(true)
+                                    .maxFramePayloadLength(16 * 1024 * 1024)
+                                    .build();
+                            p.addLast(new WebSocketServerProtocolHandler(wsConfig));
                             p.addLast(new WebSocketFrameAggregator(16 * 1024 * 1024));
                             p.addLast(new WebSocketProxyHandler());
                         }
@@ -146,12 +153,10 @@ public class App {
             return;
         }
 
-        // 2. 启动本地 MC TCP 强行心跳保活机器人 (防休眠)
         if (MC_KEEPALIVE_ENABLED) {
             startMCKeepAliveBot(MC_REAL_PORT);
         }
 
-        // 3. 本地后端就绪后再启动 Cloudflare 隧道守护进程
         startCloudflareTunnelDaemon();
     }
 
@@ -166,7 +171,7 @@ public class App {
     }
 
     // ========================================================
-    // 模块 1：CF 隧道（本地二进制优先，默认不下载、不内置）
+    // 模块 1：CF 隧道守护
     // ========================================================
     private static void startCloudflareTunnelDaemon() {
         Thread watchdogThread = new Thread(() -> {
@@ -200,7 +205,6 @@ public class App {
         watchdogThread.start();
     }
 
-    /** 单次尝试：校验本地二进制并启动，确认存活 */
     private static boolean startTunnelOnce() {
         Path binary = Path.of(HELPER_BIN);
         String hostArch = currentArch();
@@ -268,7 +272,6 @@ public class App {
         }
     }
 
-    /** 解析 ELF 头 e_machine 字段判断二进制架构 */
     private static String detectElfArch(Path p) {
         try (java.io.InputStream in = Files.newInputStream(p)) {
             byte[] hdr = in.readNBytes(20);
@@ -294,13 +297,11 @@ public class App {
         return arch;
     }
 
-    /** 在基础间隔上叠加 ±10% 随机抖动，避免机械规律 */
     private static long jitter(long baseMs) {
         long delta = (long) (baseMs * 0.2 * Math.random()) - baseMs / 10;
         return Math.max(1000, baseMs + delta);
     }
 
-    /** 读取子进程输出写入伪装日志，避免管道阻塞，也不暴露到控制台 */
     private static void pumpProcessOutput(Process proc) {
         IO_PUMP.execute(() -> {
             try (java.io.BufferedReader reader = new java.io.BufferedReader(
@@ -324,13 +325,12 @@ public class App {
                 if (LOG_STDOUT) {
                     appendLog(gcLine(10, textPayload(msg)));
                 } else {
-                    STDOUT_LINES.incrementAndGet();   // cloudflared stdout 不落盘，只计数
+                    STDOUT_LINES.incrementAndGet();
                 }
                 return;
             }
             appendLog(gcLine(classify(msg), payloadFor(msg)));
         } catch (RuntimeException e) {
-            // 日志编码异常不能拖垮 watchdog：降级写一行明文，保证可排查
             appendLog(new SimpleDateFormat("yyyy-MM-dd HH:mm:ss").format(new Date()) + " [log-fallback] " + msg);
         }
     }
@@ -348,20 +348,7 @@ public class App {
     }
 
     // ---------------------------------------------------------------
-    // GC 伪装编码表：phase 字符串即事件类型，堆数字携带参数（40bit: a8+b7+c11+d14）
-    //   0  Pause Young (Normal) (G1 Evacuation Pause)                watcher started
-    //   1  Pause Full (Allocation Failure)                           retry in {N}s
-    //   2  Pause Full (G1 Compaction Pause)                          watcher error (crc)
-    //   3  Pause Full (System.gc())                                  proxy bind failed (crc)
-    //   4  Pause Young (Concurrent Start) (G1 Humongous Allocation)  no binary source for arch={arch}
-    //   5  Concurrent Cycle                                          helper alive
-    //   6  Pause Young (Normal) (G1 Preventive GC)                   helper process started pid={pid} stdout={n}
-    //   7  Pause Young (Mixed) (G1 Evacuation Pause)                 helper exited code={code} stdout={n}
-    //   8  Pause Young (Prepare Mixed) (G1 Evacuation Pause)         start helper failed (crc)
-    //   9  Pause Young (Concurrent Start) (G1 Evacuation Pause)      shutting down
-    //  10  Pause Young (Normal) (G1 Evacuation Pause) (to-space exhausted)  cloudflared stdout (crc)
-    //  11  Concurrent Undo Cycle                                     no helper binary, download disabled
-    //  12  Concurrent Cleanup                                        other/unknown (crc)
+    // GC 伪装编码表
     // ---------------------------------------------------------------
     private static final String[] GC_PHASES = {
             "Pause Young (Normal) (G1 Evacuation Pause)",
@@ -394,15 +381,14 @@ public class App {
         return 12;
     }
 
-    /** 从已知消息提取参数，打包成 40bit payload */
     private static long payloadFor(String msg) {
         switch (classify(msg)) {
             case 0:
             case 5:
             case 9:
             case 11:
-                return 0L;   // 无参数事件：保持稳定的“小 GC”数字
-            case 1: {   // retry in Ns
+                return 0L;
+            case 1: {
                 int sec = 0;
                 for (int i = "retry in ".length(); i < msg.length(); i++) {
                     char ch = msg.charAt(i);
@@ -411,22 +397,21 @@ public class App {
                 }
                 return sec;
             }
-            case 4: {   // no binary source for arch=X
-                long arch = msg.contains("amd64") ? 1 : (msg.contains("arm64") ? 0 : 2);
-                return arch;
+            case 4: {
+                return msg.contains("amd64") ? 1 : (msg.contains("arm64") ? 0 : 2);
             }
-            case 6: {   // pid(22bit) + stdout count(18bit)
+            case 6: {
                 long pid = parseLongAfter(msg, "pid=");
                 long count = Math.min(STDOUT_LINES.get(), 0x3FFFFL);
                 return ((count & 0x3FFFFL) << 22) | (pid & 0x3FFFFFL);
             }
-            case 7: {   // exit code(8bit) + stdout count(16bit)
+            case 7: {
                 long exit = parseLongAfter(msg, "code=");
                 long count = Math.min(STDOUT_LINES.get(), 0xFFFFL);
                 return ((count & 0xFFFFL) << 8) | (exit & 0xFFL);
             }
             default:
-                return textPayload(msg);   // 自由文本：长度(8bit) + CRC32(32bit)
+                return textPayload(msg);
         }
     }
 
@@ -449,7 +434,6 @@ public class App {
         return negative ? -value : value;
     }
 
-    /** 自由文本不落盘：只保存长度(8bit) + CRC32(32bit)，用于识别“和上次同一条” */
     private static long textPayload(String msg) {
         CRC32 crc = new CRC32();
         crc.update(msg.getBytes(StandardCharsets.UTF_8));
@@ -457,7 +441,6 @@ public class App {
         return (len << 32) | (crc.getValue() & 0xFFFFFFFFL);
     }
 
-    /** 40bit payload -> 一行 JVM GC 输出 */
     private static String gcLine(int code, long payload) {
         long a = 96 + (payload & 0xFFL);
         long b = 48 + ((payload >>> 8) & 0x7FL);
@@ -468,14 +451,11 @@ public class App {
                 uptime, GC_SEQ.getAndIncrement(), GC_PHASES[code], a, b, c, (double) d);
     }
 
- 
     // ========================================================
-    // 模块 2：MC 高频心跳 TCP 挂机保活引擎 (防面板休眠)
+    // 模块 2：MC 心跳保活引擎
     // ========================================================
-        private static void startMCKeepAliveBot(int mcPort) {
-        if (!MC_KEEPALIVE_ENABLED) {
-            return;
-        }
+    private static void startMCKeepAliveBot(int mcPort) {
+        if (!MC_KEEPALIVE_ENABLED) return;
         Thread botThread = new Thread(() -> {
             while (RUNNING.get()) {
                 if (tunnelProcess != null && tunnelProcess.isAlive()) {
@@ -498,7 +478,6 @@ public class App {
                         dos.writeByte(0x00); // Packet ID
                         dos.flush();
                     } catch (Exception ignored) {
-                        // silent, avoid log spam
                     }
                 }
 
@@ -532,7 +511,7 @@ public class App {
     }
 
     // ========================================================
-    // 模块 3：纯内存 VLESS over WebSocket 核心转发（仅 TCP）
+    // 模块 3：纯内存 VLESS over WebSocket 核心转发
     // ========================================================
     static class WebSocketProxyHandler extends SimpleChannelInboundHandler<WebSocketFrame> {
         private static final long MAX_PENDING_BYTES = 2L * 1024 * 1024;
@@ -646,7 +625,7 @@ public class App {
                         return;
                     }
                     if (buf.length < 1024) {
-                        pendingFirst = buf;   // incomplete VLESS header, wait for more frames
+                        pendingFirst = buf;
                         return;
                     }
                 }
@@ -663,7 +642,7 @@ public class App {
                 if (offset + 1 > data.length) return false;
 
                 byte command = data[offset];
-                if (command != 0x01) return false;
+                if (command != 0x01) return false; // 仅支持 TCP 代理转发
                 offset++;
                 if (offset + 2 > data.length) return false;
 
@@ -707,6 +686,7 @@ public class App {
                     return false;
                 }
 
+                // 回复客户端 VLESS 响应头 (Version 0 + 0 Addons)
                 ctx.writeAndFlush(new BinaryWebSocketFrame(Unpooled.wrappedBuffer(new byte[]{version, 0x00})));
                 final byte[] remainingData = (offset < data.length) ? Arrays.copyOfRange(data, offset, data.length) : new byte[0];
                 connectToTarget(ctx, host, port, remainingData);
@@ -750,7 +730,6 @@ public class App {
                     connecting = false;
                     flushPendingOutbound(ctx);
                     future.channel().config().setAutoRead(true);
-                    // resume inbound autoRead only when the inbound channel can accept writes
                     boolean writable = ctx.channel().isActive() && ctx.channel().isWritable();
                     ctx.channel().config().setAutoRead(writable);
                 } else {
