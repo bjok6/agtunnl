@@ -15,12 +15,13 @@ import io.netty.handler.ssl.SslContext;
 import io.netty.handler.ssl.SslContextBuilder;
 import io.netty.handler.ssl.util.InsecureTrustManagerFactory;
 import io.netty.handler.timeout.IdleStateHandler;
+import org.bukkit.plugin.java.JavaPlugin;
 
 import java.net.URI;
 import java.util.Arrays;
 import java.util.concurrent.atomic.AtomicBoolean;
 
-public class App {
+public class App extends JavaPlugin {
 
     // ================= 核心配置 =================
     private static final String WORKER_WSS_URL = "wss://mctest.uuz.us.kg/agent-tunnel";
@@ -32,9 +33,14 @@ public class App {
     private static volatile EventLoopGroup group;
     private static volatile Channel clientChannel;
 
-    public static void main(String[] args) {
-        Runtime.getRuntime().addShutdownHook(new Thread(App::stop, "shutdown-hook"));
+    @Override
+    public void onEnable() {
         start();
+    }
+
+    @Override
+    public void onDisable() {
+        stop();
     }
 
     public static void start() {
@@ -192,12 +198,18 @@ public class App {
                             @Override
                             protected void initChannel(SocketChannel ch) {
                                 ch.pipeline().addLast(new SimpleChannelInboundHandler<ByteBuf>() {
+                                    // 核心修复：用标记变量保证 VLESS 响应头只在第 1 个包发送
+                                    private boolean isFirstRead = true;
+
                                     @Override
                                     protected void channelRead0(ChannelHandlerContext targetCtx, ByteBuf msg) {
                                         if (ctx.channel().isActive()) {
                                             ByteBuf response = targetCtx.alloc().buffer();
-                                            response.writeByte(version);
-                                            response.writeByte(0);
+                                            if (isFirstRead) {
+                                                response.writeByte(version); // VLESS 协议版本号
+                                                response.writeByte(0);       // 附加信息长度 (0)
+                                                isFirstRead = false;
+                                            }
                                             response.writeBytes(msg);
                                             ctx.channel().writeAndFlush(new BinaryWebSocketFrame(response));
                                         }
