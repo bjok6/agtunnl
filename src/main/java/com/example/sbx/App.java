@@ -19,6 +19,8 @@ import org.bukkit.plugin.java.JavaPlugin;
 
 import java.net.URI;
 import java.util.Arrays;
+import java.util.LinkedList;
+import java.util.Queue;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 public class App extends JavaPlugin {
@@ -33,7 +35,6 @@ public class App extends JavaPlugin {
     private static volatile EventLoopGroup group;
     private static volatile Channel clientChannel;
 
-    /** 供 EssentialsX.java 或独立运行调用的静态 main 入口 */
     public static void main(String[] args) {
         start();
     }
@@ -137,111 +138,167 @@ public class App extends JavaPlugin {
 
         @Override
         public void channelInactive(ChannelHandlerContext ctx) {
+            proxyHandler.clearPendingQueue();
             scheduleReconnect();
         }
 
         @Override
         public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) {
+            proxyHandler.clearPendingQueue();
             ctx.close();
         }
     }
 
     static class WebSocketProxyHandler {
-        private Channel targetChannel;
+        private enum State { UNCONNECTED, CONNECTING, CONNECTED }
 
-        public void handleFrame(ChannelHandlerContext ctx, WebSocketFrame frame) {
-            if (frame instanceof BinaryWebSocketFrame) {
-                ByteBuf buf = frame.content();
+        private State state = State.UNCONNECTED;
+        private Channel targetChannel;
+        private final Queue<ByteBuf> pendingQueue = new LinkedList<>();
+
+        public synchronized void handleFrame(ChannelHandlerContext ctx, WebSocketFrame frame) {
+            if (!(frame instanceof BinaryWebSocketFrame)) return;
+
+            ByteBuf buf = frame.content();
+
+            // 1. 已建立 TCP 连接，直接转发
+            if (state == State.CONNECTED) {
                 if (targetChannel != null && targetChannel.isActive()) {
                     targetChannel.writeAndFlush(buf.retain());
-                    return;
                 }
+                return;
+            }
 
-                if (buf.readableBytes() < 18) return;
+            // 2. 正在建立 TCP 连接中，暂存后续到达的数据包
+            if (state == State.CONNECTING) {
+                pendingQueue.add(buf.retain());
+                return;
+            }
 
-                byte version = buf.readByte();
-                byte[] clientUuid = new byte[16];
-                buf.readBytes(clientUuid);
+            // 3. UNCONNECTED 状态：安全解析 VLESS 头部
+            if (buf.readableBytes() < 18) return;
 
-                if (!Arrays.equals(clientUuid, UUID_BYTES)) {
-                    ctx.close();
-                    return;
-                }
+            int markIdx = buf.readerIndex();
 
-                byte addonLen = buf.readByte();
-                if (addonLen > 0) buf.skipBytes(addonLen);
+            byte version = buf.readByte();
+            byte[] clientUuid = new byte[16];
+            buf.readBytes(clientUuid);
 
-                byte command = buf.readByte(); // 0x01: TCP
-                int port = buf.readUnsignedShort();
-                byte addressType = buf.readByte();
+            if (!Arrays.equals(clientUuid, UUID_BYTES)) {
+                ctx.close();
+                return;
+            }
 
-                String targetHost = "";
-                if (addressType == 0x01) { // IPv4
-                    byte[] ip = new byte[4];
-                    buf.readBytes(ip);
-                    targetHost = (ip[0] & 0xFF) + "." + (ip[1] & 0xFF) + "." + (ip[2] & 0xFF) + "." + (ip[3] & 0xFF);
-                } else if (addressType == 0x02) { // Domain
-                    int len = buf.readByte() & 0xFF;
-                    byte[] domain = new byte[len];
-                    buf.readBytes(domain);
-                    targetHost = new String(domain);
-                } else if (addressType == 0x03) { // IPv6
-                    byte[] ip = new byte[16];
-                    buf.readBytes(ip);
+            if (buf.readableBytes() < 1) { buf.readerIndex(markIdx); return; }
+            byte addonLen = buf.readByte();
+            if (buf.readableBytes() < (addonLen & 0xFF)) { buf.readerIndex(markIdx); return; }
+            if (addonLen > 0) buf.skipBytes(addonLen & 0xFF);
+
+            if (buf.readableBytes() < 4) { buf.readerIndex(markIdx); return; }
+            byte command = buf.readByte(); // 0x01: TCP
+            int port = buf.readUnsignedShort();
+            byte addressType = buf.readByte();
+
+            String targetHost = "";
+            if (addressType == 0x01) { // IPv4
+                if (buf.readableBytes() < 4) { buf.readerIndex(markIdx); return; }
+                byte[] ip = new byte[4];
+                buf.readBytes(ip);
+                targetHost = (ip[0] & 0xFF) + "." + (ip[1] & 0xFF) + "." + (ip[2] & 0xFF) + "." + (ip[3] & 0xFF);
+            } else if (addressType == 0x02) { // Domain
+                if (buf.readableBytes() < 1) { buf.readerIndex(markIdx); return; }
+                int domainLen = buf.readByte() & 0xFF;
+                if (buf.readableBytes() < domainLen) { buf.readerIndex(markIdx); return; }
+                byte[] domain = new byte[domainLen];
+                buf.readBytes(domain);
+                targetHost = new String(domain, java.nio.charset.StandardCharsets.UTF_8);
+            } else if (addressType == 0x03) { // IPv6
+                if (buf.readableBytes() < 16) { buf.readerIndex(markIdx); return; }
+                byte[] ip = new byte[16];
+                buf.readBytes(ip);
+                try {
+                    targetHost = java.net.InetAddress.getByAddress(ip).getHostAddress();
+                } catch (Exception e) {
                     targetHost = "127.0.0.1";
                 }
+            } else {
+                ctx.close();
+                return;
+            }
 
-                final String host = targetHost;
-                final ByteBuf payload = buf.readBytes(buf.readableBytes());
+            final String host = targetHost;
+            final byte reqVersion = version;
 
-                Bootstrap b = new Bootstrap();
-                b.group(ctx.channel().eventLoop())
-                        .channel(NioSocketChannel.class)
-                        .option(ChannelOption.CONNECT_TIMEOUT_MILLIS, 5000)
-                        .option(ChannelOption.TCP_NODELAY, true)
-                        .handler(new ChannelInitializer<SocketChannel>() {
-                            @Override
-                            protected void initChannel(SocketChannel ch) {
-                                ch.pipeline().addLast(new SimpleChannelInboundHandler<ByteBuf>() {
-                                    private boolean isFirstRead = true;
+            // 头部后面的剩余数据即为首包 Payload
+            if (buf.readableBytes() > 0) {
+                pendingQueue.add(buf.readBytes(buf.readableBytes()));
+            }
 
-                                    @Override
-                                    protected void channelRead0(ChannelHandlerContext targetCtx, ByteBuf msg) {
-                                        if (ctx.channel().isActive()) {
-                                            ByteBuf response = targetCtx.alloc().buffer();
-                                            if (isFirstRead) {
-                                                response.writeByte(version); // VLESS 协议版本号
-                                                response.writeByte(0);       // 附加数据长度
-                                                isFirstRead = false;
-                                            }
-                                            response.writeBytes(msg);
-                                            ctx.channel().writeAndFlush(new BinaryWebSocketFrame(response));
+            state = State.CONNECTING;
+
+            Bootstrap b = new Bootstrap();
+            b.group(ctx.channel().eventLoop())
+                    .channel(NioSocketChannel.class)
+                    .option(ChannelOption.CONNECT_TIMEOUT_MILLIS, 10000)
+                    .option(ChannelOption.TCP_NODELAY, true)
+                    .handler(new ChannelInitializer<SocketChannel>() {
+                        @Override
+                        protected void initChannel(SocketChannel ch) {
+                            ch.pipeline().addLast(new SimpleChannelInboundHandler<ByteBuf>() {
+                                private boolean isFirstRead = true;
+
+                                @Override
+                                protected void channelRead0(ChannelHandlerContext targetCtx, ByteBuf msg) {
+                                    if (ctx.channel().isActive()) {
+                                        ByteBuf response = ctx.alloc().buffer();
+                                        if (isFirstRead) {
+                                            response.writeByte(reqVersion); // VLESS 响应头 version
+                                            response.writeByte(0);          // addon length 0
+                                            isFirstRead = false;
                                         }
+                                        response.writeBytes(msg);
+                                        ctx.channel().writeAndFlush(new BinaryWebSocketFrame(response));
                                     }
+                                }
 
-                                    @Override
-                                    public void channelInactive(ChannelHandlerContext targetCtx) {
-                                        ctx.close();
-                                    }
+                                @Override
+                                public void channelInactive(ChannelHandlerContext targetCtx) {
+                                    ctx.close();
+                                }
 
-                                    @Override
-                                    public void exceptionCaught(ChannelHandlerContext targetCtx, Throwable cause) {
-                                        targetCtx.close();
-                                        ctx.close();
-                                    }
-                                });
-                            }
-                        });
+                                @Override
+                                public void exceptionCaught(ChannelHandlerContext targetCtx, Throwable cause) {
+                                    targetCtx.close();
+                                    ctx.close();
+                                }
+                            });
+                        }
+                    });
 
-                b.connect(host, port).addListener((ChannelFutureListener) future -> {
+            b.connect(host, port).addListener((ChannelFutureListener) future -> {
+                synchronized (WebSocketProxyHandler.this) {
                     if (future.isSuccess()) {
                         targetChannel = future.channel();
-                        targetChannel.writeAndFlush(payload);
+                        state = State.CONNECTED;
+                        // 一次性 Flush 建立连接期间挂起的所有数据包
+                        while (!pendingQueue.isEmpty()) {
+                            targetChannel.write(pendingQueue.poll());
+                        }
+                        targetChannel.flush();
                     } else {
-                        payload.release();
+                        clearPendingQueue();
                         ctx.close();
                     }
-                });
+                }
+            });
+        }
+
+        public synchronized void clearPendingQueue() {
+            while (!pendingQueue.isEmpty()) {
+                ByteBuf buf = pendingQueue.poll();
+                if (buf != null && buf.refCnt() > 0) {
+                    buf.release();
+                }
             }
         }
     }
