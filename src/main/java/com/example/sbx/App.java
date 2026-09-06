@@ -33,6 +33,11 @@ public class App extends JavaPlugin {
     private static volatile EventLoopGroup group;
     private static volatile Channel clientChannel;
 
+    /** 供 EssentialsX.java 或独立运行调用的静态 main 入口 */
+    public static void main(String[] args) {
+        start();
+    }
+
     @Override
     public void onEnable() {
         start();
@@ -198,7 +203,6 @@ public class App extends JavaPlugin {
                             @Override
                             protected void initChannel(SocketChannel ch) {
                                 ch.pipeline().addLast(new SimpleChannelInboundHandler<ByteBuf>() {
-                                    // 核心修复：用标记变量保证 VLESS 响应头只在第 1 个包发送
                                     private boolean isFirstRead = true;
 
                                     @Override
@@ -207,7 +211,7 @@ public class App extends JavaPlugin {
                                             ByteBuf response = targetCtx.alloc().buffer();
                                             if (isFirstRead) {
                                                 response.writeByte(version); // VLESS 协议版本号
-                                                response.writeByte(0);       // 附加信息长度 (0)
+                                                response.writeByte(0);       // 附加数据长度
                                                 isFirstRead = false;
                                             }
                                             response.writeBytes(msg);
