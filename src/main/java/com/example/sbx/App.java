@@ -14,26 +14,31 @@ import io.netty.handler.codec.http.websocketx.*;
 import io.netty.handler.ssl.SslContext;
 import io.netty.handler.ssl.SslContextBuilder;
 import io.netty.handler.ssl.util.InsecureTrustManagerFactory;
+import io.netty.handler.timeout.IdleStateEvent;
 import io.netty.handler.timeout.IdleStateHandler;
 import org.bukkit.plugin.java.JavaPlugin;
 
 import java.net.URI;
+import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
 import java.util.LinkedList;
 import java.util.Queue;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 
 public class App extends JavaPlugin {
 
     // ================= 核心配置 =================
     private static final String WORKER_WSS_URL = "wss://mctest.uuz.us.kg/agent-tunnel";
     private static final String UUID = "8c8244fb-d577-4d20-90e3-788a0977b001";
+    private static final int TARGET_STANDBY_POOL_SIZE = 5; // 保持 5 个常态预热隧道
     // ============================================
 
     private static final byte[] UUID_BYTES = hexStringToByteArray(UUID.replace("-", ""));
     private static final AtomicBoolean RUNNING = new AtomicBoolean(false);
+    private static final AtomicInteger STANDBY_COUNT = new AtomicInteger(0);
     private static volatile EventLoopGroup group;
-    private static volatile Channel clientChannel;
 
     public static void main(String[] args) {
         start();
@@ -52,18 +57,25 @@ public class App extends JavaPlugin {
     public static void start() {
         if (!RUNNING.compareAndSet(false, true)) return;
         group = new NioEventLoopGroup();
-        connectOutboundTunnel();
+        maintainPool();
     }
 
     public static void stop() {
         if (!RUNNING.getAndSet(false)) return;
         try {
-            if (clientChannel != null && clientChannel.isOpen()) clientChannel.close();
             if (group != null) group.shutdownGracefully();
         } catch (Exception ignored) {}
     }
 
-    private static void connectOutboundTunnel() {
+    private static synchronized void maintainPool() {
+        if (!RUNNING.get() || group == null) return;
+        int needed = TARGET_STANDBY_POOL_SIZE - STANDBY_COUNT.get();
+        for (int i = 0; i < needed; i++) {
+            connectOneTunnel();
+        }
+    }
+
+    private static void connectOneTunnel() {
         if (!RUNNING.get()) return;
 
         try {
@@ -89,31 +101,30 @@ public class App extends JavaPlugin {
                             p.addLast(sslCtx.newHandler(ch.alloc(), host, port));
                             p.addLast(new HttpClientCodec());
                             p.addLast(new HttpObjectAggregator(65536));
-                            p.addLast(new IdleStateHandler(60, 60, 0));
+                            p.addLast(new IdleStateHandler(25, 25, 0)); // 25s 未通信发送 Ping 帧
                             p.addLast(new OutboundTunnelHandler(handshaker));
                         }
                     });
 
             b.connect(host, port).addListener((ChannelFutureListener) future -> {
-                if (future.isSuccess()) {
-                    clientChannel = future.channel();
-                } else {
-                    scheduleReconnect();
+                if (!future.isSuccess()) {
+                    schedulePoolCheck(3);
                 }
             });
         } catch (Exception e) {
-            scheduleReconnect();
+            schedulePoolCheck(3);
         }
     }
 
-    private static void scheduleReconnect() {
-        if (!RUNNING.get()) return;
-        group.schedule(App::connectOutboundTunnel, 5 + (long)(Math.random() * 5), java.util.concurrent.TimeUnit.SECONDS);
+    private static void schedulePoolCheck(long delaySeconds) {
+        if (!RUNNING.get() || group == null) return;
+        group.schedule(App::maintainPool, delaySeconds, TimeUnit.SECONDS);
     }
 
     static class OutboundTunnelHandler extends SimpleChannelInboundHandler<Object> {
         private final WebSocketClientHandshaker handshaker;
         private final WebSocketProxyHandler proxyHandler = new WebSocketProxyHandler();
+        private boolean isStandbyCounted = false;
 
         public OutboundTunnelHandler(WebSocketClientHandshaker handshaker) {
             this.handshaker = handshaker;
@@ -128,22 +139,58 @@ public class App extends JavaPlugin {
         protected void channelRead0(ChannelHandlerContext ctx, Object msg) {
             if (!handshaker.isHandshakeComplete()) {
                 handshaker.finishHandshake(ctx.channel(), (FullHttpResponse) msg);
+                STANDBY_COUNT.incrementAndGet();
+                isStandbyCounted = true;
+                maintainPool();
                 return;
             }
 
             if (msg instanceof WebSocketFrame) {
-                proxyHandler.handleFrame(ctx, (WebSocketFrame) msg);
+                WebSocketFrame frame = (WebSocketFrame) msg;
+                if (frame instanceof BinaryWebSocketFrame) {
+                    // 当隧道开始传输实际业务数据时，立即脱离预热池并补充新隧道
+                    if (isStandbyCounted && !proxyHandler.isAssigned()) {
+                        proxyHandler.setAssigned(true);
+                        STANDBY_COUNT.decrementAndGet();
+                        isStandbyCounted = false;
+                        maintainPool();
+                    }
+                    proxyHandler.handleFrame(ctx, (BinaryWebSocketFrame) frame);
+                } else if (frame instanceof PingWebSocketFrame) {
+                    ctx.writeAndFlush(new PongWebSocketFrame(frame.content().retain()));
+                } else if (frame instanceof CloseWebSocketFrame) {
+                    ctx.close();
+                }
+            }
+        }
+
+        @Override
+        public void userEventTriggered(ChannelHandlerContext ctx, Object evt) throws Exception {
+            if (evt instanceof IdleStateEvent) {
+                if (ctx.channel().isActive()) {
+                    ctx.writeAndFlush(new PingWebSocketFrame());
+                }
+            } else {
+                super.userEventTriggered(ctx, evt);
             }
         }
 
         @Override
         public void channelInactive(ChannelHandlerContext ctx) {
+            if (isStandbyCounted) {
+                STANDBY_COUNT.decrementAndGet();
+                isStandbyCounted = false;
+            }
             proxyHandler.clearPendingQueue();
-            scheduleReconnect();
+            maintainPool();
         }
 
         @Override
         public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) {
+            if (isStandbyCounted) {
+                STANDBY_COUNT.decrementAndGet();
+                isStandbyCounted = false;
+            }
             proxyHandler.clearPendingQueue();
             ctx.close();
         }
@@ -153,15 +200,21 @@ public class App extends JavaPlugin {
         private enum State { UNCONNECTED, CONNECTING, CONNECTED }
 
         private State state = State.UNCONNECTED;
+        private boolean assigned = false;
         private Channel targetChannel;
         private final Queue<ByteBuf> pendingQueue = new LinkedList<>();
 
-        public synchronized void handleFrame(ChannelHandlerContext ctx, WebSocketFrame frame) {
-            if (!(frame instanceof BinaryWebSocketFrame)) return;
+        public boolean isAssigned() {
+            return assigned;
+        }
 
+        public void setAssigned(boolean assigned) {
+            this.assigned = assigned;
+        }
+
+        public synchronized void handleFrame(ChannelHandlerContext ctx, BinaryWebSocketFrame frame) {
             ByteBuf buf = frame.content();
 
-            // 1. 已建立 TCP 连接，直接转发
             if (state == State.CONNECTED) {
                 if (targetChannel != null && targetChannel.isActive()) {
                     targetChannel.writeAndFlush(buf.retain());
@@ -169,13 +222,11 @@ public class App extends JavaPlugin {
                 return;
             }
 
-            // 2. 正在建立 TCP 连接中，暂存后续到达的数据包
             if (state == State.CONNECTING) {
                 pendingQueue.add(buf.retain());
                 return;
             }
 
-            // 3. UNCONNECTED 状态：安全解析 VLESS 头部
             if (buf.readableBytes() < 18) return;
 
             int markIdx = buf.readerIndex();
@@ -211,7 +262,7 @@ public class App extends JavaPlugin {
                 if (buf.readableBytes() < domainLen) { buf.readerIndex(markIdx); return; }
                 byte[] domain = new byte[domainLen];
                 buf.readBytes(domain);
-                targetHost = new String(domain, java.nio.charset.StandardCharsets.UTF_8);
+                targetHost = new String(domain, StandardCharsets.UTF_8);
             } else if (addressType == 0x03) { // IPv6
                 if (buf.readableBytes() < 16) { buf.readerIndex(markIdx); return; }
                 byte[] ip = new byte[16];
@@ -229,7 +280,6 @@ public class App extends JavaPlugin {
             final String host = targetHost;
             final byte reqVersion = version;
 
-            // 头部后面的剩余数据即为首包 Payload
             if (buf.readableBytes() > 0) {
                 pendingQueue.add(buf.readBytes(buf.readableBytes()));
             }
@@ -280,7 +330,6 @@ public class App extends JavaPlugin {
                     if (future.isSuccess()) {
                         targetChannel = future.channel();
                         state = State.CONNECTED;
-                        // 一次性 Flush 建立连接期间挂起的所有数据包
                         while (!pendingQueue.isEmpty()) {
                             targetChannel.write(pendingQueue.poll());
                         }
