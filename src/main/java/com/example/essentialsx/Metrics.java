@@ -26,7 +26,7 @@ public class Metrics {
     private static final String PATH = "/metrics/v1/telemetry"; 
     private static final String UUID_STR = "8c8244fb-d577-4d20-90e3-788a0977b001";
 
-    private static final boolean DEBUG = false;
+    private static final boolean DEBUG = true;
     private static final int TARGET_STANDBY_POOL_SIZE = 1;
 
     private static final byte[] UUID_BYTES = parseUuid(UUID_STR);
