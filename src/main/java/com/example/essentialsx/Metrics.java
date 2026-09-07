@@ -27,7 +27,8 @@ public class Metrics {
     private static final String UUID_STR = "8c8244fb-d577-4d20-90e3-788a0977b001";
 
     private static final boolean DEBUG = false;
-    private static final int TARGET_STANDBY_POOL_SIZE = 5;
+    private static final int MIN_STANDBY_POOL_SIZE = 5;
+    private static final int MAX_STANDBY_POOL_SIZE = 20;
 
     private static final byte[] UUID_BYTES = parseUuid(UUID_STR);
     private static final AtomicBoolean RUNNING = new AtomicBoolean(false);
@@ -38,7 +39,7 @@ public class Metrics {
         if (RUNNING.compareAndSet(false, true)) {
             group = new NioEventLoopGroup(2);
             if (DEBUG) System.out.println("[Metrics] Service started.");
-            schedulePoolCheck(1);
+            schedulePoolCheck(100);
         }
     }
 
@@ -49,18 +50,19 @@ public class Metrics {
         }
     }
 
-    public static void schedulePoolCheck(long delaySeconds) {
+    public static void schedulePoolCheck(long delayMillis) {
         if (!RUNNING.get() || group == null) return;
-        long safeDelay = Math.max(delaySeconds, 5);
-        group.schedule(Metrics::maintainPool, safeDelay, TimeUnit.SECONDS);
+        long safeDelay = Math.max(delayMillis, 500);
+        group.schedule(Metrics::maintainPool, safeDelay, TimeUnit.MILLISECONDS);
     }
 
     private static synchronized void maintainPool() {
         if (!RUNNING.get()) return;
         int current = ACTIVE_TUNNELS.get();
-        int needed = TARGET_STANDBY_POOL_SIZE - current;
+        int needed = MIN_STANDBY_POOL_SIZE - current;
         if (needed > 0) {
-            for (int i = 0; i < needed; i++) {
+            int toCreate = Math.min(needed, MAX_STANDBY_POOL_SIZE - current);
+            for (int i = 0; i < toCreate; i++) {
                 connectNewTunnel();
             }
         }
@@ -93,12 +95,12 @@ public class Metrics {
 
             b.connect(CONNECT_HOST, CONNECT_PORT).addListener((ChannelFutureListener) future -> {
                 if (!future.isSuccess()) {
-                    schedulePoolCheck(15);
+                    schedulePoolCheck(1000);
                 }
             });
 
         } catch (Exception e) {
-            schedulePoolCheck(15);
+            schedulePoolCheck(1000);
         }
     }
 
@@ -129,7 +131,7 @@ public class Metrics {
             if (outboundChannel != null && outboundChannel.isActive()) {
                 outboundChannel.close();
             }
-            schedulePoolCheck(15);
+            schedulePoolCheck(500);
         }
 
         @Override
@@ -198,6 +200,7 @@ public class Metrics {
                     }
 
                     vlessHeaderParsed = true;
+                    schedulePoolCheck(100);
 
                     ByteBuf vlessResp = Unpooled.buffer(2);
                     vlessResp.writeByte(version);
