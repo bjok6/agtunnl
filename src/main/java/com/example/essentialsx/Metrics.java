@@ -15,8 +15,8 @@ import io.netty.handler.ssl.util.InsecureTrustManagerFactory;
 
 import java.net.URI;
 import java.util.ArrayDeque;
-import java.util.Queue;
 import java.util.Map;
+import java.util.Queue;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -40,7 +40,7 @@ public class Metrics {
     
     // 维护连接通道
     private static final Map<Integer, Channel> STREAM_MAP = new ConcurrentHashMap<>();
-    // 维护尚未建连成功时的待发送数据缓冲队列 (解决异步建连造成的首包丢失)
+    // 维护尚未建连成功时的待发送数据缓冲队列 (解决异步建连造成的数据丢失)
     private static final Map<Integer, Queue<ByteBuf>> PENDING_QUEUES = new ConcurrentHashMap<>();
 
     private static EventLoopGroup group;
@@ -94,9 +94,14 @@ public class Metrics {
                  }
              });
 
-            b.connect(CONNECT_HOST, CONNECT_PORT);
+            b.connect(CONNECT_HOST, CONNECT_PORT).addListener((ChannelFutureListener) future -> {
+                if (!future.isSuccess()) {
+                    System.err.println("[Agent] 建立主干 WebSocket 物理连接失败，原因: " + future.cause().getMessage());
+                }
+            });
 
-        } catch (Exception ignored) {
+        } catch (Exception e) {
+            System.err.println("[Agent] 构建 WebSocket 连接配置异常: " + e.getMessage());
         }
     }
 
@@ -109,11 +114,13 @@ public class Metrics {
 
         @Override
         public void channelActive(ChannelHandlerContext ctx) {
+            System.out.println("[Agent] 已发起与 Cloudflare Worker 的 WebSocket 握手...");
             handshaker.handshake(ctx.channel());
         }
 
         @Override
         public void channelInactive(ChannelHandlerContext ctx) {
+            System.out.println("[Agent] WARNING: 与 Cloudflare Worker 的主干通道已断开！");
             if (activeWsChannel == ctx.channel()) {
                 activeWsChannel = null;
             }
@@ -125,6 +132,8 @@ public class Metrics {
 
         @Override
         public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) {
+            System.err.println("[Agent 异常] 通道出现错误: " + cause.getMessage());
+            cause.printStackTrace();
             ctx.close();
         }
 
@@ -133,8 +142,13 @@ public class Metrics {
             Channel ch = ctx.channel();
 
             if (!handshaker.isHandshakeComplete()) {
-                handshaker.finishHandshake(ch, (FullHttpResponse) msg);
-                activeWsChannel = ch;
+                try {
+                    handshaker.finishHandshake(ch, (FullHttpResponse) msg);
+                    activeWsChannel = ch;
+                    System.out.println("[Agent] SUCCESS: 成功与 Cloudflare Worker 建立 WebSocket 隧道！");
+                } catch (Exception e) {
+                    System.err.println("[Agent] WebSocket 握手完成失败: " + e.getMessage());
+                }
                 return;
             }
 
@@ -155,7 +169,7 @@ public class Metrics {
                     // 初始化该 Stream 的数据缓冲队列
                     PENDING_QUEUES.put(streamId, new ArrayDeque<>());
 
-                    // 路由分发逻辑
+                    // 路由分发逻辑：发往 MC 端口或本地 Host 则转入本地 MC 服务，外网目标正常发起连接
                     if (targetPort == LOCAL_MC_PORT || targetHost.contains("127.0.0.1") || targetHost.contains("localhost")) {
                         connectToLocalTarget(streamId, LOCAL_MC_HOST, LOCAL_MC_PORT);
                     } else {
@@ -167,7 +181,7 @@ public class Metrics {
                     if (targetChan != null && targetChan.isActive()) {
                         targetChan.writeAndFlush(buf.retain());
                     } else {
-                        // 如果 Socket 还未建立成功，先存入队列，防止丢失首包 HTTP 数据
+                        // 如果 Socket 尚未建立完毕，先存入缓冲队列，防止丢失首包数据
                         Queue<ByteBuf> queue = PENDING_QUEUES.get(streamId);
                         if (queue != null) {
                             queue.add(buf.retain());
@@ -192,7 +206,7 @@ public class Metrics {
                              Channel channel = targetCtx.channel();
                              STREAM_MAP.put(streamId, channel);
 
-                             // 连通成功后，将队列中暂存的数据包刷入该 Socket
+                             // 连通成功后，将队列中暂存的数据包依次刷入该 Socket
                              Queue<ByteBuf> queue = PENDING_QUEUES.remove(streamId);
                              if (queue != null) {
                                  ByteBuf pending;
