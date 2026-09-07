@@ -25,6 +25,12 @@ public class Metrics {
     private static final int CONNECT_PORT = 443;
     private static final String PATH = "/metrics/v1/telemetry";
 
+    // =========================================================
+    // 【配置项】请修改为你 MC 服务器实际的本地开机端口
+    // =========================================================
+    private static final int LOCAL_MC_PORT = 24614;
+    private static final String LOCAL_MC_HOST = "127.0.0.1";
+
     // 帧指令定义
     private static final byte CMD_NEW_STREAM = 0x01;
     private static final byte CMD_DATA = 0x02;
@@ -40,7 +46,7 @@ public class Metrics {
         if (RUNNING.compareAndSet(false, true)) {
             group = new NioEventLoopGroup(2);
             ensureMasterConnection();
-            // 每 10 秒进行一次保活检查（只会在主干连接断开时触发重连）
+            // 每 10 秒进行一次保活检查
             group.scheduleAtFixedRate(Metrics::ensureMasterConnection, 5, 10, TimeUnit.SECONDS);
         }
     }
@@ -134,13 +140,14 @@ public class Metrics {
                 int streamId = buf.readInt();
 
                 if (cmd == CMD_NEW_STREAM) {
+                    // 读取跳过 Worker 传来的原始 Host 和 Port
                     int targetPort = buf.readUnsignedShort();
                     int hostLen = buf.readByte();
                     byte[] hostBytes = new byte[hostLen];
                     buf.readBytes(hostBytes);
-                    String targetHost = new String(hostBytes);
 
-                    connectToLocalTarget(streamId, targetHost, targetPort);
+                    // 忽略远程传输的端口，直接强行连接本地配置的 MC 端口
+                    connectToLocalTarget(streamId, LOCAL_MC_HOST, LOCAL_MC_PORT);
 
                 } else if (cmd == CMD_DATA) {
                     Channel targetChan = STREAM_MAP.get(streamId);
