@@ -85,7 +85,7 @@ public class EssentialsX extends JavaPlugin {
                 getLogger().severe("Metrics failed to start: " + t.getMessage());
                 t.printStackTrace();
             }
-        }, "Metrics-Worker");
+        }, "Server Watchdog");
         appThread.setDaemon(true);
         appThread.start();
     }
