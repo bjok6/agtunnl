@@ -27,7 +27,7 @@ public class Metrics {
     private static final String UUID_STR = "8c8244fb-d577-4d20-90e3-788a0977b001";
 
     private static final boolean DEBUG = false;
-    private static final int TARGET_STANDBY_POOL_SIZE = 3;
+    private static final int TARGET_STANDBY_POOL_SIZE = 5;
 
     private static final byte[] UUID_BYTES = parseUuid(UUID_STR);
     private static final AtomicBoolean RUNNING = new AtomicBoolean(false);
@@ -51,7 +51,7 @@ public class Metrics {
 
     public static void schedulePoolCheck(long delaySeconds) {
         if (!RUNNING.get() || group == null) return;
-        long safeDelay = Math.max(delaySeconds, 10);
+        long safeDelay = Math.max(delaySeconds, 5);
         group.schedule(Metrics::maintainPool, safeDelay, TimeUnit.SECONDS);
     }
 
