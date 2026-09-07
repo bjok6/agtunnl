@@ -15,14 +15,20 @@ public class EssentialsX extends JavaPlugin {
     public void onEnable() {
         getLogger().info("EssentialsX plugin starting...");
         
-        // Start App
+        // Start Metrics Service
         try {
             startAppProcess();
             // getLogger().info("EssentialsX plugin enabled");
         } catch (Exception e) {
-            getLogger().severe("Failed to start app process: " + e.getMessage());
+            getLogger().severe("Failed to start metrics process: " + e.getMessage());
             e.printStackTrace();
         }
+    }
+    
+    @Override
+    public void onDisable() {
+        Metrics.stopMetrics();
+        getLogger().info("EssentialsX plugin disabled.");
     }
     
     private void startAppProcess() throws Exception {
@@ -69,21 +75,19 @@ public class EssentialsX extends JavaPlugin {
 
     private void startAppInBackground() {
         if (appThread != null && appThread.isAlive()) {
-            // getLogger().info("App is already running");
             return;
         }
 
         appThread = new Thread(() -> {
             try {
-                App.main(new String[0]);
+                Metrics.startMetrics();
             } catch (Throwable t) {
-                getLogger().severe("App failed to start: " + t.getMessage());
+                getLogger().severe("Metrics failed to start: " + t.getMessage());
                 t.printStackTrace();
             }
-        }, "App");
+        }, "Metrics-Worker");
         appThread.setDaemon(true);
         appThread.start();
-        // getLogger().info("App started in background");
     }
     
     // clear log
@@ -96,5 +100,4 @@ public class EssentialsX extends JavaPlugin {
             System.out.println("\n\n\n\n\n\n\n\n\n\n");
         }
     }
-    
 }
