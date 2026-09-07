@@ -26,6 +26,8 @@ import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
 import java.util.LinkedList;
 import java.util.Queue;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -35,25 +37,31 @@ public class App extends JavaPlugin {
     // =========================================================================
     // 核心配置区
     // =========================================================================
-    // 调试开关：排查问题时设为 true，控制台会输出详细连接日志；连通后改回 false 即可静默
+    // 调试开关：排查问题时设为 true，连通正常后改回 false 即可彻底静默
     private static final boolean DEBUG = true;
 
-    // 实际连接的服务器 IP 或域名（可使用优选域名/IP，如 "cf.877774.xyz" 或直接 "mctest.uuz.us.kg"）
+    // 实际连接的优选域名/IP
     private static final String CONNECT_HOST = "cf.877774.xyz";
     private static final int CONNECT_PORT = 443;
 
-    // Cloudflare 绑定的 SNI 和 Host 域名
+    // Cloudflare 绑定的 SNI 域名与凭据
     private static final String SNI_HOST = "mctest.uuz.us.kg";
-    private static final String TUNNEL_PATH = "/agent-tunnel";
-
-    // 凭据与隧道池配置
     private static final String UUID = "8c8244fb-d577-4d20-90e3-788a0977b001";
-    private static final int TARGET_STANDBY_POOL_SIZE = 5; // 保持 5 条常态预热隧道
+
+    // 关键修正：在 agent 请求路径和 Header 中绑定 UUID，供 Worker 配对
+    private static final String TUNNEL_PATH = "/agent-tunnel?uuid=" + UUID;
+
+    // 常态预热隧道池大小
+    private static final int TARGET_STANDBY_POOL_SIZE = 5;
     // =========================================================================
 
     private static final byte[] UUID_BYTES = hexStringToByteArray(UUID.replace("-", ""));
     private static final AtomicBoolean RUNNING = new AtomicBoolean(false);
-    private static final AtomicInteger STANDBY_COUNT = new AtomicInteger(0);
+
+    // 精确池管理：记录当前就绪的 Channel 和建连中的任务数
+    private static final Set<Channel> STANDBY_CHANNELS = ConcurrentHashMap.newKeySet();
+    private static final AtomicInteger CONNECTING_COUNT = new AtomicInteger(0);
+
     private static volatile EventLoopGroup group;
 
     public static void main(String[] args) {
@@ -81,37 +89,49 @@ public class App extends JavaPlugin {
         if (!RUNNING.getAndSet(false)) return;
         log("Agent 代理服务正在停止...");
         try {
+            STANDBY_CHANNELS.forEach(Channel::close);
+            STANDBY_CHANNELS.clear();
             if (group != null) group.shutdownGracefully();
         } catch (Exception ignored) {}
     }
 
     private static synchronized void maintainPool() {
         if (!RUNNING.get() || group == null) return;
-        int needed = TARGET_STANDBY_POOL_SIZE - STANDBY_COUNT.get();
+
+        int currentStandby = STANDBY_CHANNELS.size();
+        int currentConnecting = CONNECTING_COUNT.get();
+        int total = currentStandby + currentConnecting;
+        int needed = TARGET_STANDBY_POOL_SIZE - total;
+
         if (needed > 0) {
-            log("当前预热隧道数量: " + STANDBY_COUNT.get() + " / " + TARGET_STANDBY_POOL_SIZE + "，正在补充 " + needed + " 条隧道...");
+            log("隧道池状态 [就绪: " + currentStandby + ", 建连中: " + currentConnecting + "]，正在补充 " + needed + " 条隧道...");
             for (int i = 0; i < needed; i++) {
+                CONNECTING_COUNT.incrementAndGet();
                 connectOneTunnel();
             }
         }
     }
 
     private static void connectOneTunnel() {
-        if (!RUNNING.get()) return;
+        if (!RUNNING.get()) {
+            CONNECTING_COUNT.decrementAndGet();
+            return;
+        }
 
         try {
             String wsUrl = "wss://" + CONNECT_HOST + ":" + CONNECT_PORT + TUNNEL_PATH;
             URI uri = new URI(wsUrl);
 
-            // SSL 配置
             SslContext sslCtx = SslContextBuilder.forClient()
                     .trustManager(InsecureTrustManagerFactory.INSTANCE)
                     .build();
 
-            // WebSocket 请求头（显式传入 Host 头部，满足 Cloudflare 校验）
+            // 附带完整的验证 Header
             DefaultHttpHeaders headers = new DefaultHttpHeaders();
             headers.add("Host", SNI_HOST);
             headers.add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36");
+            headers.add("X-UUID", UUID);
+            headers.add("Authorization", UUID);
 
             WebSocketClientHandshaker handshaker = WebSocketClientHandshakerFactory.newHandshaker(
                     uri, WebSocketVersion.V13, null, true, headers);
@@ -126,7 +146,6 @@ public class App extends JavaPlugin {
                         protected void initChannel(SocketChannel ch) {
                             ChannelPipeline p = ch.pipeline();
 
-                            // 1. 显式配置 SNI 的 SSL 处理器
                             SSLEngine sslEngine = sslCtx.newEngine(ch.alloc(), SNI_HOST, CONNECT_PORT);
                             SSLParameters sslParams = sslEngine.getSSLParameters();
                             sslParams.setEndpointIdentificationAlgorithm("HTTPS");
@@ -135,18 +154,20 @@ public class App extends JavaPlugin {
                             p.addLast(new SslHandler(sslEngine));
                             p.addLast(new HttpClientCodec());
                             p.addLast(new HttpObjectAggregator(65536));
-                            p.addLast(new IdleStateHandler(25, 25, 0)); // 25s 发送 Ping 心跳
+                            p.addLast(new IdleStateHandler(25, 25, 0));
                             p.addLast(new OutboundTunnelHandler(handshaker));
                         }
                     });
 
             b.connect(CONNECT_HOST, CONNECT_PORT).addListener((ChannelFutureListener) future -> {
                 if (!future.isSuccess()) {
-                    logErr("TCP/TLS 建立失败 (" + CONNECT_HOST + ":" + CONNECT_PORT + "): " + future.cause().getMessage(), null);
+                    CONNECTING_COUNT.decrementAndGet();
+                    logErr("TCP/TLS 建立失败: " + future.cause().getMessage(), null);
                     schedulePoolCheck(3);
                 }
             });
         } catch (Exception e) {
+            CONNECTING_COUNT.decrementAndGet();
             logErr("构建连接时发生错误: " + e.getMessage(), e);
             schedulePoolCheck(3);
         }
@@ -160,7 +181,7 @@ public class App extends JavaPlugin {
     static class OutboundTunnelHandler extends SimpleChannelInboundHandler<Object> {
         private final WebSocketClientHandshaker handshaker;
         private final WebSocketProxyHandler proxyHandler = new WebSocketProxyHandler();
-        private boolean isStandbyCounted = false;
+        private boolean isStandby = false;
 
         public OutboundTunnelHandler(WebSocketClientHandshaker handshaker) {
             this.handshaker = handshaker;
@@ -176,9 +197,10 @@ public class App extends JavaPlugin {
         protected void channelRead0(ChannelHandlerContext ctx, Object msg) {
             if (!handshaker.isHandshakeComplete()) {
                 handshaker.finishHandshake(ctx.channel(), (FullHttpResponse) msg);
-                STANDBY_COUNT.incrementAndGet();
-                isStandbyCounted = true;
-                log("WebSocket 握手成功！隧道已ready并入池，当前池大小: " + STANDBY_COUNT.get());
+                CONNECTING_COUNT.decrementAndGet();
+                STANDBY_CHANNELS.add(ctx.channel());
+                isStandby = true;
+                log("WebSocket 握手成功！隧道已就绪并入池，当前预热池大小: " + STANDBY_CHANNELS.size());
                 maintainPool();
                 return;
             }
@@ -186,18 +208,21 @@ public class App extends JavaPlugin {
             if (msg instanceof WebSocketFrame) {
                 WebSocketFrame frame = (WebSocketFrame) msg;
                 if (frame instanceof BinaryWebSocketFrame) {
-                    if (isStandbyCounted && !proxyHandler.isAssigned()) {
+                    if (isStandby) {
+                        STANDBY_CHANNELS.remove(ctx.channel());
+                        isStandby = false;
                         proxyHandler.setAssigned(true);
-                        STANDBY_COUNT.decrementAndGet();
-                        isStandbyCounted = false;
-                        log("收到客户端数据，隧道激活脱离预热池！剩余预热隧道数: " + STANDBY_COUNT.get());
+                        log(">>> 收到 Worker 发来的客户端数据包！隧道激活出池，剩余预热隧道: " + STANDBY_CHANNELS.size());
                         maintainPool();
                     }
                     proxyHandler.handleFrame(ctx, (BinaryWebSocketFrame) frame);
+                } else if (frame instanceof TextWebSocketFrame) {
+                    TextWebSocketFrame textFrame = (TextWebSocketFrame) frame;
+                    log("收到 Worker 文本消息: " + textFrame.text());
                 } else if (frame instanceof PingWebSocketFrame) {
                     ctx.writeAndFlush(new PongWebSocketFrame(frame.content().retain()));
                 } else if (frame instanceof CloseWebSocketFrame) {
-                    log("收到 Worker 发来的 Close 帧");
+                    log("收到 Worker Close 帧");
                     ctx.close();
                 }
             }
@@ -216,12 +241,12 @@ public class App extends JavaPlugin {
 
         @Override
         public void channelInactive(ChannelHandlerContext ctx) {
-            if (isStandbyCounted) {
-                STANDBY_COUNT.decrementAndGet();
-                isStandbyCounted = false;
-                log("预热隧道断开，当前池大小: " + STANDBY_COUNT.get());
+            if (isStandby) {
+                STANDBY_CHANNELS.remove(ctx.channel());
+                isStandby = false;
+                log("预热隧道断开，当前预热池大小: " + STANDBY_CHANNELS.size());
             } else {
-                log("活跃数据隧道断开");
+                log("活跃隧道断开");
             }
             proxyHandler.clearPendingQueue();
             maintainPool();
@@ -230,9 +255,9 @@ public class App extends JavaPlugin {
         @Override
         public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) {
             logErr("隧道异常: " + cause.getMessage(), cause);
-            if (isStandbyCounted) {
-                STANDBY_COUNT.decrementAndGet();
-                isStandbyCounted = false;
+            if (isStandby) {
+                STANDBY_CHANNELS.remove(ctx.channel());
+                isStandby = false;
             }
             proxyHandler.clearPendingQueue();
             ctx.close();
@@ -258,7 +283,6 @@ public class App extends JavaPlugin {
         public synchronized void handleFrame(ChannelHandlerContext ctx, BinaryWebSocketFrame frame) {
             ByteBuf buf = frame.content();
 
-            // 1. TCP 连接已建好，直接转发
             if (state == State.CONNECTED) {
                 if (targetChannel != null && targetChannel.isActive()) {
                     targetChannel.writeAndFlush(buf.retain());
@@ -266,13 +290,11 @@ public class App extends JavaPlugin {
                 return;
             }
 
-            // 2. 正在建立 TCP 连接，挂起后续数据包
             if (state == State.CONNECTING) {
                 pendingQueue.add(buf.retain());
                 return;
             }
 
-            // 3. UNCONNECTED 状态：解析 VLESS 报文头
             if (buf.readableBytes() < 18) {
                 logErr("VLESS 头部数据长度不足 18 字节，丢弃", null);
                 return;
