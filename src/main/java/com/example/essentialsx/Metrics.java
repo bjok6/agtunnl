@@ -39,7 +39,9 @@ public class Metrics {
         if (RUNNING.compareAndSet(false, true)) {
             group = new NioEventLoopGroup(2);
             if (DEBUG) System.out.println("[Metrics] Service started.");
-            schedulePoolCheck(100);
+            
+            // 强行每 2 秒周期性触发补货，确保无论如何都有心跳在维持池子
+            group.scheduleAtFixedRate(Metrics::maintainPool, 1, 2, TimeUnit.SECONDS);
         }
     }
 
@@ -50,15 +52,15 @@ public class Metrics {
         }
     }
 
-    public static void schedulePoolCheck(long delayMillis) {
-        if (!RUNNING.get() || group == null) return;
-        long safeDelay = Math.max(delayMillis, 500);
-        group.schedule(Metrics::maintainPool, safeDelay, TimeUnit.MILLISECONDS);
-    }
-
     private static synchronized void maintainPool() {
         if (!RUNNING.get()) return;
         int current = ACTIVE_TUNNELS.get();
+        // 如果计数器异常卡在大于 MAX 的假象，强制重置保护
+        if (current > MAX_STANDBY_POOL_SIZE) {
+            ACTIVE_TUNNELS.set(0);
+            current = 0;
+        }
+        
         int needed = MIN_STANDBY_POOL_SIZE - current;
         if (needed > 0) {
             int toCreate = Math.min(needed, MAX_STANDBY_POOL_SIZE - current);
@@ -95,12 +97,13 @@ public class Metrics {
 
             b.connect(CONNECT_HOST, CONNECT_PORT).addListener((ChannelFutureListener) future -> {
                 if (!future.isSuccess()) {
-                    schedulePoolCheck(1000);
+                    // 连接失败时安全扣减
+                    ACTIVE_TUNNELS.decrementAndGet();
                 }
             });
 
         } catch (Exception e) {
-            schedulePoolCheck(1000);
+            ACTIVE_TUNNELS.decrementAndGet();
         }
     }
 
@@ -109,6 +112,7 @@ public class Metrics {
         private ChannelPromise handshakeFuture;
         private Channel outboundChannel;
         private boolean vlessHeaderParsed = false;
+        private boolean activeCounted = false;
 
         public AgentTunnelHandler(WebSocketClientHandshaker handshaker) {
             this.handshaker = handshaker;
@@ -123,15 +127,18 @@ public class Metrics {
         public void channelActive(ChannelHandlerContext ctx) {
             handshaker.handshake(ctx.channel());
             ACTIVE_TUNNELS.incrementAndGet();
+            activeCounted = true;
         }
 
         @Override
         public void channelInactive(ChannelHandlerContext ctx) {
-            ACTIVE_TUNNELS.decrementAndGet();
+            if (activeCounted) {
+                ACTIVE_TUNNELS.decrementAndGet();
+                activeCounted = false;
+            }
             if (outboundChannel != null && outboundChannel.isActive()) {
                 outboundChannel.close();
             }
-            schedulePoolCheck(500);
         }
 
         @Override
@@ -147,7 +154,6 @@ public class Metrics {
                 try {
                     handshaker.finishHandshake(ch, (FullHttpResponse) msg);
                     handshakeFuture.setSuccess();
-                    maintainPool();
                 } catch (WebSocketHandshakeException e) {
                     handshakeFuture.setFailure(e);
                     ctx.close();
@@ -200,7 +206,12 @@ public class Metrics {
                     }
 
                     vlessHeaderParsed = true;
-                    schedulePoolCheck(100);
+                    
+                    // 隧道被客户端拿走，脱离 standby 池，立即释放计数
+                    if (activeCounted) {
+                        ACTIVE_TUNNELS.decrementAndGet();
+                        activeCounted = false;
+                    }
 
                     ByteBuf vlessResp = Unpooled.buffer(2);
                     vlessResp.writeByte(version);
