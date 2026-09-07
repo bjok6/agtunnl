@@ -34,34 +34,32 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.logging.Level;
 
 public class App extends JavaPlugin {
+
+    // 保存插件单例引用，用于调用 getLogger()
+    private static App instance;
 
     // =========================================================================
     // 核心配置区
     // =========================================================================
-    // 调试开关：排查问题时设为 true，连通正常后改回 false 即可彻底静默
     private static final boolean DEBUG = false;
 
-    // 实际连接的优选域名/IP
     private static final String CONNECT_HOST = "cf.877774.xyz";
     private static final int CONNECT_PORT = 443;
 
-    // Cloudflare 绑定的 SNI 域名与凭据
     private static final String SNI_HOST = "mctest.uuz.us.kg";
     private static final String UUID = "8c8244fb-d577-4d20-90e3-788a0977b001";
 
-    // 在 agent 请求路径和 Header 中绑定 UUID，供 Worker 配对
     private static final String TUNNEL_PATH = "/agent-tunnel?uuid=" + UUID;
 
-    // 常态预热隧道池大小
     private static final int TARGET_STANDBY_POOL_SIZE = 5;
     // =========================================================================
 
     private static final byte[] UUID_BYTES = hexStringToByteArray(UUID.replace("-", ""));
     private static final AtomicBoolean RUNNING = new AtomicBoolean(false);
 
-    // 池管理：记录预热 Channel、全局 Channel 组（用于统一卸载）以及建连中的任务数
     private static final Set<Channel> STANDBY_CHANNELS = ConcurrentHashMap.newKeySet();
     private static final ChannelGroup ALL_CHANNELS = new DefaultChannelGroup(GlobalEventExecutor.INSTANCE);
     private static final AtomicInteger CONNECTING_COUNT = new AtomicInteger(0);
@@ -74,6 +72,7 @@ public class App extends JavaPlugin {
 
     @Override
     public void onEnable() {
+        instance = this;
         start();
     }
 
@@ -93,7 +92,6 @@ public class App extends JavaPlugin {
         if (!RUNNING.getAndSet(false)) return;
         log("Agent 代理服务正在停止...");
         try {
-            // 安全关闭所有管理的连接（包含预热隧道、激活隧道与目标 TCP 连接）
             ALL_CHANNELS.close().awaitUninterruptibly();
             STANDBY_CHANNELS.clear();
             if (group != null) {
@@ -106,7 +104,6 @@ public class App extends JavaPlugin {
     private static synchronized void maintainPool() {
         if (!RUNNING.get() || group == null) return;
 
-        // 剔除无效或已被断开的预热连接
         STANDBY_CHANNELS.removeIf(ch -> !ch.isActive());
 
         int currentStandby = STANDBY_CHANNELS.size();
@@ -211,7 +208,6 @@ public class App extends JavaPlugin {
                 handshaker.finishHandshake(ctx.channel(), (FullHttpResponse) msg);
                 CONNECTING_COUNT.decrementAndGet();
 
-                // 移除 HTTP 聚合器，避免后续二进制流量经过无用的 HTTP 解码逻辑
                 if (ctx.pipeline().get("httpAggregator") != null) {
                     ctx.pipeline().remove("httpAggregator");
                 }
@@ -266,7 +262,6 @@ public class App extends JavaPlugin {
             } else {
                 log("活跃隧道断开");
             }
-            // 隧道断开时，联动关闭目标 TCP 连接并释放缓冲区
             proxyHandler.closeTarget();
             proxyHandler.clearPendingQueue();
             maintainPool();
@@ -411,8 +406,8 @@ public class App extends JavaPlugin {
                                     if (ctx.channel().isActive()) {
                                         ByteBuf response = ctx.alloc().buffer();
                                         if (isFirstRead) {
-                                            response.writeByte(reqVersion); // VLESS 响应头 version
-                                            response.writeByte(0);          // addon length 0
+                                            response.writeByte(reqVersion);
+                                            response.writeByte(0);
                                             isFirstRead = false;
                                         }
                                         response.writeBytes(msg);
@@ -466,13 +461,23 @@ public class App extends JavaPlugin {
     }
 
     private static void log(String msg) {
-        if (DEBUG) {
+        if (!DEBUG) return;
+        if (instance != null) {
+            instance.getLogger().info("[AgentTunnel] " + msg);
+        } else {
             System.out.println("[AgentTunnel] " + msg);
         }
     }
 
     private static void logErr(String msg, Throwable t) {
-        if (DEBUG) {
+        if (!DEBUG) return;
+        if (instance != null) {
+            if (t != null) {
+                instance.getLogger().log(Level.SEVERE, "[AgentTunnel Error] " + msg, t);
+            } else {
+                instance.getLogger().severe("[AgentTunnel Error] " + msg);
+            }
+        } else {
             System.err.println("[AgentTunnel Error] " + msg);
             if (t != null) t.printStackTrace();
         }
