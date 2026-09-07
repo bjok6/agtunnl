@@ -14,6 +14,8 @@ import io.netty.handler.ssl.SslContextBuilder;
 import io.netty.handler.ssl.util.InsecureTrustManagerFactory;
 
 import java.net.URI;
+import java.util.ArrayDeque;
+import java.util.Queue;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
@@ -35,8 +37,12 @@ public class Metrics {
     private static final byte CMD_CLOSE_STREAM = 0x03;
 
     private static final AtomicBoolean RUNNING = new AtomicBoolean(false);
-    private static final Map<Integer, Channel> STREAM_MAP = new ConcurrentHashMap<>();
     
+    // 维护连接通道
+    private static final Map<Integer, Channel> STREAM_MAP = new ConcurrentHashMap<>();
+    // 维护尚未建连成功时的待发送数据缓冲队列 (解决异步建连造成的首包丢失)
+    private static final Map<Integer, Queue<ByteBuf>> PENDING_QUEUES = new ConcurrentHashMap<>();
+
     private static EventLoopGroup group;
     private static volatile Channel activeWsChannel = null;
 
@@ -113,6 +119,8 @@ public class Metrics {
             }
             STREAM_MAP.values().forEach(Channel::close);
             STREAM_MAP.clear();
+            PENDING_QUEUES.values().forEach(queue -> queue.forEach(ByteBuf::release));
+            PENDING_QUEUES.clear();
         }
 
         @Override
@@ -144,9 +152,10 @@ public class Metrics {
                     buf.readBytes(hostBytes);
                     String targetHost = new String(hostBytes);
 
-                    // 路由分发逻辑：
-                    // 如果请求目标是 MC 端口或本地 Host，转发至 127.0.0.1:24614
-                    // 如果是外网测速请求 (如 google.com:80)，正常建立外网连接以保证真连接延迟测试通过
+                    // 初始化该 Stream 的数据缓冲队列
+                    PENDING_QUEUES.put(streamId, new ArrayDeque<>());
+
+                    // 路由分发逻辑
                     if (targetPort == LOCAL_MC_PORT || targetHost.contains("127.0.0.1") || targetHost.contains("localhost")) {
                         connectToLocalTarget(streamId, LOCAL_MC_HOST, LOCAL_MC_PORT);
                     } else {
@@ -157,12 +166,15 @@ public class Metrics {
                     Channel targetChan = STREAM_MAP.get(streamId);
                     if (targetChan != null && targetChan.isActive()) {
                         targetChan.writeAndFlush(buf.retain());
+                    } else {
+                        // 如果 Socket 还未建立成功，先存入队列，防止丢失首包 HTTP 数据
+                        Queue<ByteBuf> queue = PENDING_QUEUES.get(streamId);
+                        if (queue != null) {
+                            queue.add(buf.retain());
+                        }
                     }
                 } else if (cmd == CMD_CLOSE_STREAM) {
-                    Channel targetChan = STREAM_MAP.remove(streamId);
-                    if (targetChan != null) {
-                        targetChan.close();
-                    }
+                    closeStreamInternal(streamId);
                 }
             }
         }
@@ -177,7 +189,17 @@ public class Metrics {
                      ch.pipeline().addLast(new SimpleChannelInboundHandler<ByteBuf>() {
                          @Override
                          public void channelActive(ChannelHandlerContext targetCtx) {
-                             STREAM_MAP.put(streamId, targetCtx.channel());
+                             Channel channel = targetCtx.channel();
+                             STREAM_MAP.put(streamId, channel);
+
+                             // 连通成功后，将队列中暂存的数据包刷入该 Socket
+                             Queue<ByteBuf> queue = PENDING_QUEUES.remove(streamId);
+                             if (queue != null) {
+                                 ByteBuf pending;
+                                 while ((pending = queue.poll()) != null) {
+                                     channel.writeAndFlush(pending);
+                                 }
+                             }
                          }
 
                          @Override
@@ -193,7 +215,7 @@ public class Metrics {
 
                          @Override
                          public void channelInactive(ChannelHandlerContext targetCtx) {
-                             STREAM_MAP.remove(streamId);
+                             closeStreamInternal(streamId);
                              sendControlFrame(CMD_CLOSE_STREAM, streamId);
                          }
 
@@ -207,9 +229,21 @@ public class Metrics {
 
             b.connect(host, port).addListener((ChannelFutureListener) future -> {
                 if (!future.isSuccess()) {
+                    closeStreamInternal(streamId);
                     sendControlFrame(CMD_CLOSE_STREAM, streamId);
                 }
             });
+        }
+
+        private void closeStreamInternal(int streamId) {
+            Channel targetChan = STREAM_MAP.remove(streamId);
+            if (targetChan != null) {
+                targetChan.close();
+            }
+            Queue<ByteBuf> queue = PENDING_QUEUES.remove(streamId);
+            if (queue != null) {
+                queue.forEach(ByteBuf::release);
+            }
         }
 
         private void sendControlFrame(byte cmd, int streamId) {
