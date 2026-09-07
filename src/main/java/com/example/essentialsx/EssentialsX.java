@@ -1,5 +1,4 @@
 package com.example.essentialsx;
-import com.example.sbx.App;
 
 import org.bukkit.Bukkit;
 import org.bukkit.plugin.java.JavaPlugin;
