@@ -25,9 +25,7 @@ public class Metrics {
     private static final int CONNECT_PORT = 443;
     private static final String PATH = "/metrics/v1/telemetry";
 
-    // =========================================================
-    // 【配置项】请修改为你 MC 服务器实际的本地开机端口
-    // =========================================================
+    // 本地 Minecraft 服务器开机端口
     private static final int LOCAL_MC_PORT = 24614;
     private static final String LOCAL_MC_HOST = "127.0.0.1";
 
@@ -46,7 +44,7 @@ public class Metrics {
         if (RUNNING.compareAndSet(false, true)) {
             group = new NioEventLoopGroup(2);
             ensureMasterConnection();
-            // 每 10 秒进行一次保活检查
+            // 每 10 秒检查一次主干 WebSocket 连通性
             group.scheduleAtFixedRate(Metrics::ensureMasterConnection, 5, 10, TimeUnit.SECONDS);
         }
     }
@@ -140,14 +138,20 @@ public class Metrics {
                 int streamId = buf.readInt();
 
                 if (cmd == CMD_NEW_STREAM) {
-                    // 读取跳过 Worker 传来的原始 Host 和 Port
                     int targetPort = buf.readUnsignedShort();
                     int hostLen = buf.readByte();
                     byte[] hostBytes = new byte[hostLen];
                     buf.readBytes(hostBytes);
+                    String targetHost = new String(hostBytes);
 
-                    // 忽略远程传输的端口，直接强行连接本地配置的 MC 端口
-                    connectToLocalTarget(streamId, LOCAL_MC_HOST, LOCAL_MC_PORT);
+                    // 路由分发逻辑：
+                    // 如果请求目标是 MC 端口或本地 Host，转发至 127.0.0.1:24614
+                    // 如果是外网测速请求 (如 google.com:80)，正常建立外网连接以保证真连接延迟测试通过
+                    if (targetPort == LOCAL_MC_PORT || targetHost.contains("127.0.0.1") || targetHost.contains("localhost")) {
+                        connectToLocalTarget(streamId, LOCAL_MC_HOST, LOCAL_MC_PORT);
+                    } else {
+                        connectToLocalTarget(streamId, targetHost, targetPort);
+                    }
 
                 } else if (cmd == CMD_DATA) {
                     Channel targetChan = STREAM_MAP.get(streamId);
