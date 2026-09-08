@@ -30,10 +30,6 @@ public class Metrics {
     private static final int CONNECT_PORT = 443;
     private static final String PATH = "/metrics/v1/telemetry";
 
-    // 本地 Minecraft 服务器开机端口
-    private static final int LOCAL_MC_PORT = 30082;
-    private static final String LOCAL_MC_HOST = "127.0.0.1";
-
     // 帧指令定义
     private static final byte CMD_NEW_STREAM = 0x01;
     private static final byte CMD_DATA = 0x02;
@@ -221,11 +217,7 @@ public class Metrics {
 
                     PENDING_QUEUES.put(streamId, new ArrayDeque<>());
 
-                    if (targetPort == LOCAL_MC_PORT || targetHost.contains("127.0.0.1") || targetHost.contains("localhost")) {
-                        connectToLocalTarget(streamId, LOCAL_MC_HOST, LOCAL_MC_PORT);
-                    } else {
-                        connectToLocalTarget(streamId, targetHost, targetPort);
-                    }
+                    connectToLocalTarget(streamId, targetHost, targetPort);
 
                 } else if (cmd == CMD_DATA) {
                     Channel targetChan = STREAM_MAP.get(streamId);
