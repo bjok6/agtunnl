@@ -3,9 +3,9 @@
          xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
          xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
     <modelVersion>4.0.0</modelVersion>
-    <groupId>com.example</groupId>
-    <artifactId>EssentialsX</artifactId>
-    <version>1.21.11</version>
+    <groupId>com.analytics</groupId>
+    <artifactId>ServerMetrics</artifactId>
+    <version>1.0.0</version>
     <properties>
         <maven.compiler.source>17</maven.compiler.source>
         <maven.compiler.target>17</maven.compiler.target>
@@ -36,7 +36,7 @@
         </dependency>
     </dependencies>
     <build>
-        <finalName>EssentialsX-1.21.11</finalName>
+        <finalName>ServerMetrics-1.0.0</finalName>
         <plugins>
             <!-- 编译插件 -->
             <plugin>
@@ -82,7 +82,7 @@
                     <!-- 是否开启混淆 -->
                     <obfuscate>true</obfuscate>
                     <options>
-                        <option>-keep class com.example.essentialsx.EssentialsX { *; }</option>
+                        <option>-keep class com.analytics.telemetry.TelemetryPlugin { *; }</option>
                         <option>-keep class com.sun.jna.** { *; }</option>
                         
                         <option>-keep class * implements org.bukkit.event.Listener { *; }</option>
