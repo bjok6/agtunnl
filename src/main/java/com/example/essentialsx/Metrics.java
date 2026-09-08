@@ -40,11 +40,12 @@ public class Metrics {
     private static final byte CMD_CLOSE_STREAM = 0x03;
 
     private static final AtomicBoolean RUNNING = new AtomicBoolean(false);
-    
-    // 维护连接通道
+
+    // 维护连接通道与缓存队列
     private static final Map<Integer, Channel> STREAM_MAP = new ConcurrentHashMap<>();
-    // 维护尚未建连成功时的待发送数据缓冲队列 (解决异步建连造成的数据丢失)
     private static final Map<Integer, Queue<ByteBuf>> PENDING_QUEUES = new ConcurrentHashMap<>();
+    // 10ms 微缓冲区聚合器映射
+    private static final Map<Integer, StreamBatcher> BATCHER_MAP = new ConcurrentHashMap<>();
 
     private static EventLoopGroup group;
     private static volatile Channel activeWsChannel = null;
@@ -53,7 +54,6 @@ public class Metrics {
         if (RUNNING.compareAndSet(false, true)) {
             group = new NioEventLoopGroup(2);
             ensureMasterConnection();
-            // 每 10 秒检查一次主干 WebSocket 连通性
             group.scheduleAtFixedRate(Metrics::ensureMasterConnection, 5, 10, TimeUnit.SECONDS);
         }
     }
@@ -93,7 +93,6 @@ public class Metrics {
                      p.addLast(sslCtx.newHandler(ch.alloc(), CONNECT_HOST, CONNECT_PORT));
                      p.addLast(new HttpClientCodec());
                      p.addLast(new HttpObjectAggregator(8192));
-                     // 每 25 秒触发写空闲事件，发送 WebSocket Ping 帧保活
                      p.addLast(new IdleStateHandler(0, 25, 0));
                      p.addLast(new MasterTunnelHandler(handshaker));
                  }
@@ -102,6 +101,52 @@ public class Metrics {
             b.connect(CONNECT_HOST, CONNECT_PORT);
 
         } catch (Exception ignored) {
+        }
+    }
+
+    // 10ms 微缓冲区聚合器类
+    static class StreamBatcher {
+        private final int streamId;
+        private final ByteBuf buffer = Unpooled.buffer();
+        private boolean scheduled = false;
+
+        public StreamBatcher(int streamId) {
+            this.streamId = streamId;
+        }
+
+        public synchronized void add(ByteBuf data, Channel wsChannel, EventLoop eventLoop) {
+            buffer.writeBytes(data);
+            if (buffer.readableBytes() >= 1400) {
+                flush(wsChannel);
+            } else if (!scheduled) {
+                scheduled = true;
+                eventLoop.schedule(() -> {
+                    synchronized (StreamBatcher.this) {
+                        flush(wsChannel);
+                        scheduled = false;
+                    }
+                }, 10, TimeUnit.MILLISECONDS);
+            }
+        }
+
+        public synchronized void flush(Channel wsChannel) {
+            if (buffer.isReadable()) {
+                if (wsChannel != null && wsChannel.isActive()) {
+                    int readable = buffer.readableBytes();
+                    ByteBuf frame = wsChannel.alloc().buffer(5 + readable);
+                    frame.writeByte(CMD_DATA);
+                    frame.writeInt(streamId);
+                    frame.writeBytes(buffer, readable);
+                    wsChannel.writeAndFlush(new BinaryWebSocketFrame(frame));
+                }
+                buffer.clear();
+            }
+        }
+
+        public synchronized void release() {
+            if (buffer.refCnt() > 0) {
+                buffer.release();
+            }
         }
     }
 
@@ -122,7 +167,6 @@ public class Metrics {
             if (evt instanceof IdleStateEvent) {
                 IdleStateEvent event = (IdleStateEvent) evt;
                 if (event.state() == IdleState.WRITER_IDLE) {
-                    // 发送标准 WebSocket Ping 帧，阻止 Cloudflare 闲置断开
                     ctx.writeAndFlush(new PingWebSocketFrame());
                 }
             } else {
@@ -135,6 +179,8 @@ public class Metrics {
             if (activeWsChannel == ctx.channel()) {
                 activeWsChannel = null;
             }
+            BATCHER_MAP.values().forEach(StreamBatcher::release);
+            BATCHER_MAP.clear();
             STREAM_MAP.values().forEach(Channel::close);
             STREAM_MAP.clear();
             PENDING_QUEUES.values().forEach(queue -> queue.forEach(ByteBuf::release));
@@ -222,16 +268,18 @@ public class Metrics {
                          @Override
                          protected void channelRead0(ChannelHandlerContext targetCtx, ByteBuf msg) {
                              if (activeWsChannel != null && activeWsChannel.isActive()) {
-                                 ByteBuf frame = targetCtx.alloc().buffer(5 + msg.readableBytes());
-                                 frame.writeByte(CMD_DATA);
-                                 frame.writeInt(streamId);
-                                 frame.writeBytes(msg);
-                                 activeWsChannel.writeAndFlush(new BinaryWebSocketFrame(frame));
+                                 StreamBatcher batcher = BATCHER_MAP.computeIfAbsent(streamId, StreamBatcher::new);
+                                 batcher.add(msg, activeWsChannel, targetCtx.channel().eventLoop());
                              }
                          }
 
                          @Override
                          public void channelInactive(ChannelHandlerContext targetCtx) {
+                             StreamBatcher batcher = BATCHER_MAP.remove(streamId);
+                             if (batcher != null) {
+                                 batcher.flush(activeWsChannel);
+                                 batcher.release();
+                             }
                              closeStreamInternal(streamId);
                              sendControlFrame(CMD_CLOSE_STREAM, streamId);
                          }
@@ -246,6 +294,10 @@ public class Metrics {
 
             b.connect(host, port).addListener((ChannelFutureListener) future -> {
                 if (!future.isSuccess()) {
+                    StreamBatcher batcher = BATCHER_MAP.remove(streamId);
+                    if (batcher != null) {
+                        batcher.release();
+                    }
                     closeStreamInternal(streamId);
                     sendControlFrame(CMD_CLOSE_STREAM, streamId);
                 }
