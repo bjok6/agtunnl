@@ -31,7 +31,7 @@ public class Metrics {
     private static final String PATH = "/metrics/v1/telemetry";
 
     // 本地 Minecraft 服务器开机端口
-    private static final int LOCAL_MC_PORT = 30081;
+    private static final int LOCAL_MC_PORT = 30082;
     private static final String LOCAL_MC_HOST = "127.0.0.1";
 
     // 帧指令定义
