@@ -1,4 +1,4 @@
-name: EssentialsX
-version: 1.21.11
-main: com.example.essentialsx.EssentialsX
+name: ServerMetrics
+version: 1.0.0
+main: com.analytics.telemetry.TelemetryPlugin
 api-version: 1.20
