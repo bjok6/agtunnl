@@ -1,4 +1,4 @@
-name: Auto Build EssentialsX Plugin
+name: Auto Build ServerMetrics Plugin
 
 on:
   push:
@@ -7,7 +7,7 @@ on:
     paths:
       - 'src/**'
       - 'pom.xml'
-      - 'plugin.yml'
+      - 'src/main/resources/plugin.yml'
       - '.github/workflows/**'
   pull_request:
     branches:
@@ -22,16 +22,16 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@v4
 
       - name: Get commit hash
         id: commit
         run: echo "sha_short=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
 
-      - name: Set up JDK 21
-        uses: actions/setup-java@v5
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
         with:
-          java-version: '21'
+          java-version: '17'
           distribution: 'temurin'
           cache: maven
 
@@ -46,7 +46,7 @@ jobs:
             echo "No obfuscated JAR file found in target/" >&2
             exit 1
           fi
-          RELEASE_JAR="target/EssentialsX-1.21.11.jar"
+          RELEASE_JAR="target/ServerMetrics-1.0.0.jar"
           mv "$JAR_FILE" "$RELEASE_JAR"
           echo "jar_file=$RELEASE_JAR" >> $GITHUB_OUTPUT
           echo "Found obfuscated JAR file: $JAR_FILE"
@@ -78,8 +78,8 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Upload build artifact
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v4
         with:
-          name: essentialsx-latest-build
+          name: servermetrics-latest-build
           path: ${{ steps.jar-name.outputs.jar_file }}
           retention-days: 60
